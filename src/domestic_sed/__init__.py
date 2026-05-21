@@ -1,2 +1,2 @@
-"""Top-level package for sound event lab."""
+"""Top-level package for the domestic sound event detection task."""
 

@@ -14,8 +14,12 @@ dependencies = [
   "lightning>=2.2,<3.0",
   "PyYAML>=6.0",
   "pandas>=2.2",
+  "scikit-learn>=1.5",
   "torchmetrics>=1.4",
 ]
+
+[project.scripts]
+domestic-sed-eval = "domestic_sed.evaluation:main"
 
 [project.optional-dependencies]
 dev = [
