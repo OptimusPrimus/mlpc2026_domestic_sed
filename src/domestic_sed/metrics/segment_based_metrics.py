@@ -25,14 +25,61 @@ class ClassEvaluation:
     f1: float
     map: float
 
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Evaluate event predictions against ground-truth annotations with 0.5 s segments."
+    )
+    parser.add_argument("ground_truth_csv", type=Path, help="Path to the ground-truth CSV file.")
+    parser.add_argument("prediction_csv", type=Path, help="Path to the prediction CSV file.")
+    parser.add_argument(
+        "--audio-dir",
+        type=Path,
+        default=None,
+        help="Optional directory containing audio files used to validate prediction durations.",
+    )
+    args = parser.parse_args()
+
+    macro_f1, results = evaluate_prediction_csvs(
+        args.ground_truth_csv,
+        args.prediction_csv,
+        audio_dir=args.audio_dir,
+    )
+
+    if results.empty:
+        print("No classes found in the provided files.")
+    else:
+        print(results.to_csv(index=False).strip())
+    print(f"macro_f1,{macro_f1:.6f}")
 
 
-def load_annotation_csv(path: str | Path, ground_truth=False) -> pd.DataFrame:
+def evaluate_prediction_csvs(
+    ground_truth_csv: str | Path,
+    prediction_csv: str | Path,
+    *,
+    audio_dir: str | Path | None = None,
+) -> tuple[pd.DataFrame, float]:
+    """Evaluate predictions against ground truth CSVs, optionally validating audio bounds."""
+
+    print("Loading ground truth... ")
+    ground_truth = load_annotation_csv(ground_truth_csv, ground_truth=True)
+
+    print("Aggregating ground truth annotations in CSV via majority vote...")
+    ground_truth = aggregate_ground_truth_annotations(ground_truth)
+
+    print("Loading predictions... ")
+    predictions = load_annotation_csv(prediction_csv, ground_truth=False, audio_dir=audio_dir)
+
+    ground_truth_segments = build_segment_frame_from_intervals(ground_truth, name="ground_truth")
+    prediction_segments = build_segment_frame_from_intervals(predictions, name="predictions")
+    return calculate_f1_score(ground_truth_segments, prediction_segments)
+
+
+def load_annotation_csv(path: str | Path, ground_truth=False, audio_dir=None) -> pd.DataFrame:
+    """Load an annotation CSV and validate required columns, timestamps, and optional audio bounds."""
     csv_path = Path(path).expanduser().resolve()
     df = pd.read_csv(csv_path)
     name = str(csv_path)
     # check columns
-
 
     if ground_truth:
         req = REQUIRED_COLUMNS.union({"annotator_id"})
@@ -49,7 +96,7 @@ def load_annotation_csv(path: str | Path, ground_truth=False) -> pd.DataFrame:
         invalid_rows = df.loc[df["offset"] < df["onset"], ["filename", "annotation", "onset", "offset"]]
         raise ValueError(f"{name} contains rows where offset is smaller than onset:\n{invalid_rows}")
 
-    prediction_classes = set(predictions["annotation"].dropna().unique().tolist())
+    prediction_classes = set(df["annotation"].dropna().unique().tolist())
     unexpected_classes = sorted(prediction_classes.difference(CLASS_NAMES))
     if unexpected_classes:
         unexpected_classes_list = ", ".join(unexpected_classes)
@@ -58,50 +105,24 @@ def load_annotation_csv(path: str | Path, ground_truth=False) -> pd.DataFrame:
             f"{unexpected_classes_list}"
         )
 
+    if audio_dir:
+        audio_durations = get_audio_durations(audio_dir=audio_dir)
+        for i, row in df.iterrows():
+            if row['onset'] > audio_durations[row['filename']] or row['offset'] > audio_durations[row['filename']]:
+                raise ValueError(
+                    "prediction is outside of waveform support: "
+                    f"{row['filename']}, {row['annotation']}, {row['onset']}, {row['offset']}"
+                )
+
     return df
 
-
-def get_audio_durations(audio_dir: str | Path) -> dict[str, float]:
-
-    def _get_audio_duration_seconds(audio_path: Path) -> float:
-
-        if audio_path.suffix.lower() == ".wav":
-            with wave.open(str(audio_path), "rb") as wav_file:
-                sample_rate = wav_file.getframerate()
-                frame_count = wav_file.getnframes()
-            if sample_rate <= 0:
-                raise ValueError(f"Invalid sample rate for audio file: {audio_path}")
-            return frame_count / sample_rate
-
-        import torchaudio
-
-        info = torchaudio.info(str(audio_path))
-        if info.sample_rate <= 0:
-            raise ValueError(f"Invalid sample rate for audio file: {audio_path}")
-        return info.num_frames / info.sample_rate
-
-
-    audio_root = Path(audio_dir).expanduser().resolve()
-    if not audio_root.is_dir():
-        raise FileNotFoundError(f"Audio directory not found: {audio_root}")
-
-    durations: dict[str, float] = {}
-    for audio_path in sorted(path for path in audio_root.rglob("*") if path.is_file()):
-        if audio_path.name in durations:
-            raise ValueError(
-                f"Duplicate audio filename found under {audio_root}: {audio_path.name}. "
-                "CSV evaluation matches audio files by basename."
-            )
-        duration = _get_audio_duration_seconds(audio_path)
-        durations[audio_path.name] = math.ceil(float(duration) * 2) / 2
-
-    return durations
 
 
 def calculate_f1_score(
     ground_truth_segments: pd.DataFrame,
     prediction_segments: pd.DataFrame,
 ) -> tuple[float, pd.DataFrame]:
+    """Return macro F1 and a per-class precision/recall/F1 table from segment labels."""
     combined_index = ground_truth_segments.index.union(prediction_segments.index)
     ground_truth_segments = ground_truth_segments.reindex(combined_index, fill_value=0)
     prediction_segments = prediction_segments.reindex(combined_index, fill_value=0)
@@ -135,6 +156,7 @@ def calculate_map_score(
         ground_truth_segments: pd.DataFrame,
         prediction_segments: pd.DataFrame,
 ) -> tuple[float, pd.DataFrame]:
+    """Return macro average precision and a per-class metric table from segment labels."""
     combined_index = ground_truth_segments.index.union(prediction_segments.index)
     ground_truth_segments = ground_truth_segments.reindex(combined_index, fill_value=0)
     prediction_segments = prediction_segments.reindex(combined_index, fill_value=0)
@@ -167,38 +189,14 @@ def calculate_map_score(
         "annotation"
     ).reset_index(drop=True)
     macro_map = float(results["map"].mean())
-
     return macro_map, results
-
-
-def evaluate_prediction_csvs(
-    ground_truth_csv: str | Path,
-    prediction_csv: str | Path,
-    *,
-    audio_dir: str | Path | None = None,
-) -> tuple[pd.DataFrame, float]:
-
-    print("Loading ground truth... ")
-    ground_truth = load_annotation_csv(ground_truth_csv, ground_truth=True)
-
-    print("Aggregating ground truth annotations in CSV via majority vote...")
-    ground_truth = aggregate_ground_truth_annotations(ground_truth)
-
-    print("Loading predictions... ")
-    predictions = load_annotation_csv(prediction_csv)
-
-    audio_durations = get_audio_durations(audio_dir) if audio_dir is not None else None
-    ground_truth_segments = build_segment_frame_from_intervals(ground_truth, audio_durations=audio_durations, name="ground_truth")
-    prediction_segments = build_segment_frame_from_intervals(predictions, audio_durations=audio_durations, name="predictions")
-    return calculate_f1_score(ground_truth_segments, prediction_segments)
-
 
 def build_segment_frame_from_intervals(
     df: pd.DataFrame,
     *,
-    audio_durations: dict[str, float] | None,
     name: str,
 ) -> pd.DataFrame:
+    """Expand interval annotations into a 0.5 s multi-hot segment frame."""
 
     def _iter_segments(onset: float, offset: float) -> Iterable[float]:
         if offset <= onset:
@@ -212,18 +210,6 @@ def build_segment_frame_from_intervals(
         # round to half seconds
         onset = round(float(record.onset) * (1/SEGMENT_SECONDS)) / 2
         offset = round(float(record.offset) * (1/SEGMENT_SECONDS)) / 2
-
-        if audio_durations is not None:
-            max_duration = audio_durations.get(record.filename)
-            if max_duration is None:
-                raise ValueError(f"{name} references an audio file not found in the audio directory: {record.filename}")
-            if onset < 0 or offset < 0:
-                raise ValueError(f"{name} contains negative timestamps for {record.filename}")
-            if onset > max_duration or offset > max_duration:
-                raise ValueError(
-                    f"{name} contains timestamps outside the audio duration for {record.filename}: "
-                    f"onset={onset}, offset={offset}, max_duration={max_duration}"
-                )
 
         for segment_start in _iter_segments(onset, offset):
             rows.append(
@@ -253,6 +239,7 @@ def build_segment_frame_from_intervals(
 
 
 def aggregate_ground_truth_annotations(df: pd.DataFrame, *, file_col: str = "filename") -> pd.DataFrame:
+    """Collapse annotator intervals into majority-vote intervals per file and class."""
 
     def _merge_intervals(intervals: list[tuple[float, float]]) -> list[tuple[float, float]]:
         if not intervals:
@@ -335,33 +322,33 @@ def aggregate_ground_truth_annotations(df: pd.DataFrame, *, file_col: str = "fil
     return pd.DataFrame(merged_rows, columns=["filename", "annotation", "onset", "offset"])
 
 
+def get_audio_durations(audio_dir: str | Path) -> dict[str, float]:
+    """Return basename-keyed WAV durations from metadata, rounded up to 0.5 s."""
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Evaluate event predictions against ground-truth annotations with 0.5 s segments."
-    )
-    parser.add_argument("ground_truth_csv", type=Path, help="Path to the ground-truth CSV file.")
-    parser.add_argument("prediction_csv", type=Path, help="Path to the prediction CSV file.")
-    parser.add_argument(
-        "--audio-dir",
-        type=Path,
-        default=None,
-        help="Optional directory containing audio files used to validate prediction durations.",
-    )
-    args = parser.parse_args()
+    audio_root = Path(audio_dir).expanduser().resolve()
+    if not audio_root.is_dir():
+        raise FileNotFoundError(f"Audio directory not found: {audio_root}")
 
-    macro_f1, results = evaluate_prediction_csvs(
-        args.ground_truth_csv,
-        args.prediction_csv,
-        audio_dir=args.audio_dir,
-    )
+    durations: dict[str, float] = {}
+    for audio_path in sorted(path for path in audio_root.rglob("*") if path.is_file()):
+        if audio_path.name in durations:
+            raise ValueError(
+                f"Duplicate audio filename found under {audio_root}: {audio_path.name}. "
+                "CSV evaluation matches audio files by basename."
+            )
+        if audio_path.suffix.lower() != ".wav":
+            continue
 
-    if results.empty:
-        print("No classes found in the provided files.")
-    else:
-        print(results.to_csv(index=False).strip())
-    print(f"macro_f1,{macro_f1:.6f}")
+        with wave.open(str(audio_path), "rb") as wav_file:
+            frame_count = wav_file.getnframes()
+            sample_rate = wav_file.getframerate()
 
+        if sample_rate <= 0:
+            raise ValueError(f"Invalid sample rate for audio file: {audio_path}")
+        duration = frame_count / sample_rate
+        durations[audio_path.name] = math.ceil(float(duration) * 2) / 2
+
+    return durations
 
 if __name__ == "__main__":
     main()
