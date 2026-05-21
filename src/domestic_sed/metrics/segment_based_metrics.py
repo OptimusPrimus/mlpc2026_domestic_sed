@@ -140,8 +140,8 @@ def calculate_f1_score(
 
     per_class_results: list[ClassEvaluation] = []
     for annotation in classes:
-        gt_values = float(ground_truth_segments.get(annotation, pd.Series(0, index=combined_index, dtype=int)))
-        pred_values = float(prediction_segments.get(annotation, pd.Series(0, index=combined_index, dtype=int)))
+        gt_values = ground_truth_segments.get(annotation, pd.Series(0, index=combined_index, dtype=int))
+        pred_values = prediction_segments.get(annotation, pd.Series(0, index=combined_index, dtype=int))
         precision = float(precision_score(gt_values, pred_values, zero_division=0.0))
         recall = float(recall_score(gt_values, pred_values, zero_division=0.0))
         f1 = float(f1_score(gt_values, pred_values, zero_division=0.0))
