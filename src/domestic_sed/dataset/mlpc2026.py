@@ -4,9 +4,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 import pandas as pd
+import scipy.io.wavfile
 import torch
 from torch.utils.data import Dataset
-import torchaudio
 
 SplitName = str
 
@@ -16,6 +16,27 @@ _SPLIT_ALIASES: dict[SplitName, SplitName] = {
     "val": "validation",
     "test": "test",
 }
+
+
+def _load_wav_audio(audio_path: Path) -> tuple[torch.Tensor, int]:
+    sample_rate, waveform_np = scipy.io.wavfile.read(audio_path)
+    waveform = torch.from_numpy(waveform_np)
+
+    if waveform.ndim == 1:
+        waveform = waveform.unsqueeze(1)
+
+    if waveform.dtype == torch.uint8:
+        waveform = (waveform.to(torch.float32) - 128.0) / 128.0
+    elif waveform.dtype == torch.int16:
+        waveform = waveform.to(torch.float32) / 32768.0
+    elif waveform.dtype == torch.int32:
+        waveform = waveform.to(torch.float32) / 2147483648.0
+    elif waveform.dtype == torch.int64:
+        waveform = waveform.to(torch.float32) / 9223372036854775808.0
+    else:
+        waveform = waveform.to(torch.float32)
+
+    return waveform.transpose(0, 1).contiguous(), int(sample_rate)
 
 
 class MLPC2026SoundEventDataset(Dataset[dict[str, Any]]):
@@ -97,7 +118,7 @@ class MLPC2026SoundEventDataset(Dataset[dict[str, Any]]):
         waveform: torch.Tensor | None = None
         sample_rate: int | None = None
         if self.load_audio:
-            waveform, sample_rate = torchaudio.load(audio_path)
+            waveform, sample_rate = _load_wav_audio(audio_path)
             if self.audio_transform is not None:
                 waveform = self.audio_transform(waveform)
 
@@ -148,4 +169,3 @@ class MLPC2026SoundEventDataset(Dataset[dict[str, Any]]):
             raise ValueError(
                 f"annotations.csv is missing required columns ({missing_list}): {self.split_dir / 'annotations.csv'}"
             )
-

@@ -177,7 +177,10 @@ def calculate_map_score(
         gt_values = ground_truth_segments.get(annotation, pd.Series(0, index=combined_index, dtype=int))
         pred_values = prediction_segments.get(annotation, pd.Series(0, index=combined_index, dtype=int))
 
-        map = average_precision_score(gt_values, pred_values, zero_division=0.0)
+        if int(gt_values.sum()) == 0:
+            map = 0.0
+        else:
+            map = float(average_precision_score(gt_values, pred_values))
         pred_values = pred_values > 0.5
 
         precision = float(precision_score(gt_values, pred_values, zero_division=0.0))

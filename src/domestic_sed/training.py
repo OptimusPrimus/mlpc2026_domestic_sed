@@ -1,0 +1,507 @@
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+from typing import Any
+
+import lightning as L
+import pandas as pd
+import torch
+import torchaudio
+from lightning.pytorch.loggers import WandbLogger
+from torch import nn
+from torch.utils.data import DataLoader
+
+from domestic_sed.architectures import CRNN, CRNNBlockConfig
+from domestic_sed.dataset import MLPC2026SoundEventDataset
+from domestic_sed.metrics.segment_based_metrics import (
+    SEGMENT_SECONDS,
+    build_segment_frame_from_intervals,
+    calculate_map_score,
+)
+
+
+DEFAULT_SAMPLE_RATE = 44_100
+DEFAULT_MEL_BINS = 128
+DEFAULT_N_FFT = 2048
+DEFAULT_HOP_LENGTH = 512
+DEFAULT_WIN_LENGTH = 2048
+DEFAULT_MAX_DURATION_SECONDS = 35.0
+MIN_INPUT_SAMPLE_RATE = DEFAULT_SAMPLE_RATE
+
+
+def _default_crnn_blocks() -> list[CRNNBlockConfig]:
+    return [
+            CRNNBlockConfig(out_channels=1, conv_kernel_size=(5, 5), conv_stride=(2,2), pool_kernel_size=(1, 1)),
+
+            CRNNBlockConfig(out_channels=64, conv_kernel_size=(3, 3), conv_stride=(1, 1), pool_kernel_size=(1, 1)),
+            CRNNBlockConfig(out_channels=64, conv_kernel_size=(3, 3), conv_stride=(1, 1), pool_kernel_size=(2, 2)),
+
+            CRNNBlockConfig(out_channels=128, conv_kernel_size=(3, 3), conv_stride=(1, 1), pool_kernel_size=(1, 1)),
+            CRNNBlockConfig(out_channels=128, conv_kernel_size=(3, 3), conv_stride=(1, 1), pool_kernel_size=(2, 2)),
+
+            CRNNBlockConfig(out_channels=256, conv_kernel_size=(3, 3), conv_stride=(1, 1), pool_kernel_size=(1, 1)),
+            CRNNBlockConfig(out_channels=256, conv_kernel_size=(3, 3), conv_stride=(1, 1), pool_kernel_size=(2, 2)),
+
+            CRNNBlockConfig(out_channels=512, conv_kernel_size=(3, 3), conv_stride=(1, 1), pool_kernel_size=(1, 1)),
+            CRNNBlockConfig(out_channels=512, conv_kernel_size=(3, 3), conv_stride=(1, 1), pool_kernel_size=(1, 1))
+        ]
+
+
+def _waveform_to_mono(waveform: torch.Tensor) -> torch.Tensor:
+    if waveform.ndim != 2:
+        raise ValueError(f"Expected waveform with shape (channels, samples), got {tuple(waveform.shape)}")
+    if waveform.shape[0] == 1:
+        return waveform.squeeze(0)
+    return waveform.mean(dim=0)
+
+
+def _prepare_class_names(
+    annotations: pd.DataFrame,
+    provided_class_names: list[str] | None,
+) -> list[str]:
+    if provided_class_names:
+        class_names = provided_class_names
+    else:
+        class_names = sorted(str(label) for label in annotations["annotation"].dropna().unique().tolist())
+
+    if len(class_names) != 15:
+        raise ValueError(f"Expected 15 classes, got {len(class_names)}: {class_names}")
+    return class_names
+
+
+class SoundEventDataModule(L.LightningDataModule):
+    def __init__(
+        self,
+        data_root: str | Path,
+        *,
+        batch_size: int,
+        num_workers: int,
+        sample_rate: int = DEFAULT_SAMPLE_RATE,
+        max_duration_seconds: float = DEFAULT_MAX_DURATION_SECONDS,
+        class_names: list[str] | None = None,
+    ) -> None:
+        super().__init__()
+        self.data_root = Path(data_root).expanduser().resolve()
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.sample_rate = sample_rate
+        self.max_duration_seconds = max_duration_seconds
+        self.max_num_samples = int(round(sample_rate * max_duration_seconds))
+        self.class_names = class_names
+        self.resamplers: dict[int, torchaudio.transforms.Resample] = {}
+
+        self.train_dataset: MLPC2026SoundEventDataset | None = None
+        self.validation_dataset: MLPC2026SoundEventDataset | None = None
+        self._class_to_index: dict[str, int] | None = None
+
+    @property
+    def class_to_index(self) -> dict[str, int]:
+        if self._class_to_index is None:
+            raise RuntimeError("DataModule.setup() must be called before accessing class_to_index.")
+        return self._class_to_index
+
+    def setup(self, stage: str | None = None) -> None:
+        del stage
+        if self.train_dataset is not None and self.validation_dataset is not None:
+            return
+
+        self.train_dataset = MLPC2026SoundEventDataset(self.data_root, split="train", load_audio=True)
+        self.validation_dataset = MLPC2026SoundEventDataset(self.data_root, split="validation", load_audio=True)
+        class_names = _prepare_class_names(self.train_dataset.annotations, self.class_names)
+        self.class_names = class_names
+        self._class_to_index = {class_name: index for index, class_name in enumerate(class_names)}
+
+    def train_dataloader(self) -> DataLoader[dict[str, Any]]:
+        if self.train_dataset is None:
+            raise RuntimeError("DataModule.setup() must be called before requesting a dataloader.")
+        return DataLoader(
+            self.train_dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=self.num_workers,
+            pin_memory=True,
+            collate_fn=self._collate_batch,
+        )
+
+    def val_dataloader(self) -> DataLoader[dict[str, Any]]:
+        if self.validation_dataset is None:
+            raise RuntimeError("DataModule.setup() must be called before requesting a dataloader.")
+        return DataLoader(
+            self.validation_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            pin_memory=True,
+            collate_fn=self._collate_batch,
+        )
+
+    def _collate_batch(self, batch: list[dict[str, Any]]) -> dict[str, Any]:
+        waveforms: list[torch.Tensor] = []
+        audio_num_samples: list[int] = []
+
+        for sample in batch:
+            waveform = sample["waveform"]
+            sample_rate = sample["sample_rate"]
+            if waveform is None or sample_rate is None:
+                raise ValueError("Dataset samples must include loaded audio for training.")
+
+            mono_waveform = _waveform_to_mono(waveform).float()
+            if sample_rate != self.sample_rate:
+                mono_waveform = self._resample_waveform(mono_waveform, sample_rate)
+            if mono_waveform.numel() > self.max_num_samples:
+                mono_waveform = mono_waveform[: self.max_num_samples]
+            audio_num_samples.append(mono_waveform.numel())
+
+            padded = torch.zeros(self.max_num_samples, dtype=mono_waveform.dtype)
+            padded[: mono_waveform.numel()] = mono_waveform
+            waveforms.append(padded)
+
+        return {
+            "waveform": torch.stack(waveforms, dim=0),
+            "audio_num_samples": torch.tensor(audio_num_samples, dtype=torch.long),
+            "filenames": [sample["filename"] for sample in batch],
+            "annotations": [sample["annotations"] for sample in batch],
+        }
+
+    def _resample_waveform(self, waveform: torch.Tensor, input_sample_rate: int) -> torch.Tensor:
+        resampler = self.resamplers.get(input_sample_rate)
+        if resampler is None:
+            resampler = torchaudio.transforms.Resample(orig_freq=input_sample_rate, new_freq=self.sample_rate)
+            self.resamplers[input_sample_rate] = resampler
+        return resampler(waveform.unsqueeze(0)).squeeze(0)
+
+
+class SoundEventLightningModule(L.LightningModule):
+    def __init__(
+        self,
+        *,
+        class_to_index: dict[str, int],
+        learning_rate: float,
+        sample_rate: int = DEFAULT_SAMPLE_RATE,
+        n_mels: int = DEFAULT_MEL_BINS,
+        n_fft: int = DEFAULT_N_FFT,
+        hop_length: int = DEFAULT_HOP_LENGTH,
+        win_length: int = DEFAULT_WIN_LENGTH,
+        lstm_hidden_size: int = 256,
+        lstm_num_layers: int = 2,
+        dropout: float = 0.2,
+    ) -> None:
+        super().__init__()
+        self.save_hyperparameters(ignore=["class_to_index"])
+        self.class_to_index = class_to_index
+        self.num_classes = len(class_to_index)
+        self.learning_rate = learning_rate
+        self.hop_length = hop_length
+        self.class_names_by_index = [class_name for class_name, _ in sorted(class_to_index.items(), key=lambda item: item[1])]
+        self.validation_predictions: list[dict[str, Any]] = []
+
+        self.mel_transform = torchaudio.transforms.MelSpectrogram(
+            sample_rate=sample_rate,
+            n_fft=n_fft,
+            win_length=win_length,
+            hop_length=hop_length,
+            n_mels=n_mels,
+            f_min=0.0,
+            f_max=sample_rate / 2,
+            power=2.0,
+            center=True,
+            norm="slaney",
+            mel_scale="slaney",
+        )
+        self.amplitude_to_db = torchaudio.transforms.AmplitudeToDB(stype="power", top_db=80.0)
+        self.model = CRNN(
+            conv_blocks=_default_crnn_blocks(),
+            input_bins=n_mels,
+            lstm_hidden_size=lstm_hidden_size,
+            lstm_num_layers=lstm_num_layers,
+            lstm_dropout=dropout,
+            dropout=dropout,
+            output_size=self.num_classes,
+        )
+
+    def forward(self, waveform: torch.Tensor) -> torch.Tensor:
+        spectrogram = self.mel_transform(waveform)
+        spectrogram = self.amplitude_to_db(spectrogram)
+        return self.model(spectrogram)
+
+    def training_step(self, batch: dict[str, Any], batch_idx: int) -> torch.Tensor:
+        del batch_idx
+        logits = self(batch["waveform"])
+        loss, _, _ = self._compute_loss(
+            logits=logits,
+            annotations_batch=batch["annotations"],
+            audio_num_samples=batch["audio_num_samples"],
+        )
+        self.log("train/loss", loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=logits.shape[0])
+        return loss
+
+    def validation_step(self, batch: dict[str, Any], batch_idx: int) -> torch.Tensor:
+        del batch_idx
+        logits = self(batch["waveform"])
+        loss, targets, loss_mask = self._compute_loss(
+            logits=logits,
+            annotations_batch=batch["annotations"],
+            audio_num_samples=batch["audio_num_samples"],
+        )
+        probabilities = torch.sigmoid(logits)
+        valid_output_frames = loss_mask[:, 0, :].sum(dim=1).to(dtype=torch.long)
+
+        for sample_index, filename in enumerate(batch["filenames"]):
+            self.validation_predictions.append(
+                {
+                    "filename": filename,
+                    "annotations": batch["annotations"][sample_index],
+                    "audio_num_samples": int(batch["audio_num_samples"][sample_index].item()),
+                    "valid_output_frames": int(valid_output_frames[sample_index].item()),
+                    "probabilities": probabilities[sample_index].detach().cpu(),
+                    "targets": targets[sample_index].detach().cpu(),
+                }
+            )
+
+        self.log("val/loss", loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=logits.shape[0])
+        return loss
+
+    def on_validation_epoch_start(self) -> None:
+        self.validation_predictions = []
+
+    def on_validation_epoch_end(self) -> None:
+        if not self.validation_predictions:
+            return
+
+        ground_truth_rows: list[pd.DataFrame] = []
+        prediction_frames: list[pd.DataFrame] = []
+        for prediction in self.validation_predictions:
+            annotations = prediction["annotations"]
+            if not annotations.empty:
+                ground_truth_rows.append(annotations.loc[:, ["filename", "annotation", "onset", "offset"]].copy())
+            prediction_frames.append(self._prediction_segments_to_frame(prediction))
+
+        if ground_truth_rows:
+            ground_truth_df = pd.concat(ground_truth_rows, ignore_index=True)
+            ground_truth_segments = build_segment_frame_from_intervals(ground_truth_df, name="validation_ground_truth")
+        else:
+            ground_truth_segments = pd.DataFrame()
+
+        if prediction_frames:
+            prediction_segments = pd.concat(prediction_frames, axis=0).sort_index()
+            prediction_segments = prediction_segments.groupby(level=["filename", "segment_start"]).max()
+        else:
+            prediction_segments = pd.DataFrame()
+
+        macro_map, _ = calculate_map_score(ground_truth_segments, prediction_segments)
+        self.log("val/map", macro_map, prog_bar=True, on_step=False, on_epoch=True, sync_dist=False)
+
+    def configure_optimizers(self) -> torch.optim.Optimizer:
+        return torch.optim.Adam(self.parameters(), lr=self.learning_rate)
+
+    def _compute_loss(
+        self,
+        *,
+        logits: torch.Tensor,
+        annotations_batch: list[pd.DataFrame],
+        audio_num_samples: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        targets = self._build_targets(
+            annotations_batch=annotations_batch,
+            audio_num_samples=audio_num_samples,
+            output_frames=logits.shape[1],
+            device=logits.device,
+            dtype=logits.dtype,
+        )
+        loss_mask = self._build_loss_mask(
+            audio_num_samples=audio_num_samples,
+            output_frames=logits.shape[1],
+            device=logits.device,
+            dtype=logits.dtype,
+        )
+        per_frame_loss = nn.functional.binary_cross_entropy_with_logits(
+            logits.transpose(1, 2),
+            targets,
+            reduction="none",
+        )
+        loss = (per_frame_loss * loss_mask).sum() / loss_mask.sum().clamp_min(1.0)
+        return loss, targets, loss_mask
+
+    def _build_loss_mask(
+        self,
+        *,
+        audio_num_samples: torch.Tensor,
+        output_frames: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        mask = torch.zeros(
+            audio_num_samples.shape[0],
+            self.num_classes,
+            output_frames,
+            device=device,
+            dtype=dtype,
+        )
+        for batch_index, num_samples in enumerate(audio_num_samples.tolist()):
+            spectrogram_frames = self._num_spectrogram_frames(num_samples)
+            valid_output_frames = self.model.output_shape(spectrogram_frames)[0]
+            valid_output_frames = max(1, min(valid_output_frames, output_frames))
+            mask[batch_index, :, :valid_output_frames] = 1.0
+        return mask
+
+    def _build_targets(
+        self,
+        *,
+        annotations_batch: list[pd.DataFrame],
+        audio_num_samples: torch.Tensor,
+        output_frames: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        targets = torch.zeros(
+            len(annotations_batch),
+            self.num_classes,
+            output_frames,
+            device=device,
+            dtype=dtype,
+        )
+
+        for batch_index, annotations in enumerate(annotations_batch):
+            clip_duration_seconds = audio_num_samples[batch_index].item() / self.hparams.sample_rate
+            if clip_duration_seconds <= 0.0 or annotations.empty:
+                continue
+
+            for row in annotations.itertuples(index=False):
+                label = str(row.annotation)
+                class_index = self.class_to_index.get(label)
+                if class_index is None:
+                    continue
+
+                onset = max(0.0, float(row.onset))
+                offset = min(clip_duration_seconds, float(row.offset))
+                if offset <= onset:
+                    continue
+
+                start_frame = int(torch.floor(torch.tensor(onset / clip_duration_seconds * output_frames)).item())
+                end_frame = int(torch.ceil(torch.tensor(offset / clip_duration_seconds * output_frames)).item())
+                start_frame = max(0, min(start_frame, output_frames - 1))
+                end_frame = max(start_frame + 1, min(end_frame, output_frames))
+                targets[batch_index, class_index, start_frame:end_frame] = 1.0
+
+        return targets
+
+    def _num_spectrogram_frames(self, num_samples: int) -> int:
+        return 1 + max(0, num_samples // self.hparams.hop_length)
+
+    def _prediction_segments_to_frame(self, prediction: dict[str, Any]) -> pd.DataFrame:
+        clip_duration_seconds = prediction["audio_num_samples"] / self.hparams.sample_rate
+        valid_output_frames = prediction["valid_output_frames"]
+        probabilities: torch.Tensor = prediction["probabilities"][:valid_output_frames]
+
+        if clip_duration_seconds <= 0.0 or valid_output_frames <= 0:
+            empty_index = pd.MultiIndex.from_tuples([], names=["filename", "segment_start"])
+            return pd.DataFrame(columns=self.class_names_by_index, index=empty_index)
+
+        num_segments = max(1, int(torch.ceil(torch.tensor(clip_duration_seconds / SEGMENT_SECONDS)).item()))
+        rows: list[dict[str, float | str]] = []
+        for segment_index in range(num_segments):
+            segment_start = segment_index * SEGMENT_SECONDS
+            segment_end = min(segment_start + SEGMENT_SECONDS, clip_duration_seconds)
+            frame_start = int(segment_start / clip_duration_seconds * valid_output_frames)
+            frame_end = int(torch.ceil(torch.tensor(segment_end / clip_duration_seconds * valid_output_frames)).item())
+            frame_start = max(0, min(frame_start, valid_output_frames - 1))
+            frame_end = max(frame_start + 1, min(frame_end, valid_output_frames))
+            segment_scores = probabilities[frame_start:frame_end].max(dim=0).values
+
+            row: dict[str, float | str] = {
+                "filename": prediction["filename"],
+                "segment_start": segment_start,
+            }
+            for class_index, class_name in enumerate(self.class_names_by_index):
+                row[class_name] = float(segment_scores[class_index].item())
+            rows.append(row)
+
+        segment_frame = pd.DataFrame(rows).set_index(["filename", "segment_start"])
+        return segment_frame.loc[:, self.class_names_by_index]
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Train a CRNN sound event detection model.")
+    parser.add_argument("--data-root", type=Path, help="Dataset root containing the train split.", default="/home/paul/data/mlpc2026_dataset/MLPC2026_challenge_dataset_raw/")
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--max-epochs", type=int, default=30)
+    parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--sample-rate", type=int, default=DEFAULT_SAMPLE_RATE)
+    parser.add_argument("--max-duration-seconds", type=float, default=DEFAULT_MAX_DURATION_SECONDS)
+    parser.add_argument("--n-mels", type=int, default=DEFAULT_MEL_BINS)
+    parser.add_argument("--n-fft", type=int, default=DEFAULT_N_FFT)
+    parser.add_argument("--hop-length", type=int, default=DEFAULT_HOP_LENGTH)
+    parser.add_argument("--win-length", type=int, default=DEFAULT_WIN_LENGTH)
+    parser.add_argument("--lstm-hidden-size", type=int, default=256)
+    parser.add_argument("--lstm-num-layers", type=int, default=2)
+    parser.add_argument("--dropout", type=float, default=0.2)
+    parser.add_argument(
+        "--class-names",
+        type=str,
+        default=None,
+        help="Comma-separated list of the 15 class names. Defaults to labels found in train/annotations.csv.",
+    )
+    parser.add_argument("--accelerator", type=str, default="auto")
+    parser.add_argument("--devices", type=str, default="auto")
+    parser.add_argument("--precision", type=str, default="32-true")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--wandb-project", type=str, default="domestic-sed")
+    parser.add_argument("--wandb-run-name", type=str, default=None)
+    parser.add_argument("--wandb-save-dir", type=Path, default=Path("wandb"))
+    return parser
+
+
+def main() -> None:
+    args = build_arg_parser().parse_args()
+    L.seed_everything(args.seed, workers=True)
+
+    initial_class_names = None
+    if args.class_names:
+        initial_class_names = [name.strip() for name in args.class_names.split(",") if name.strip()]
+
+    datamodule = SoundEventDataModule(
+        data_root=args.data_root,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        sample_rate=args.sample_rate,
+        max_duration_seconds=args.max_duration_seconds,
+        class_names=initial_class_names,
+    )
+    datamodule.setup("fit")
+
+    model = SoundEventLightningModule(
+        class_to_index=datamodule.class_to_index,
+        learning_rate=args.learning_rate,
+        sample_rate=args.sample_rate,
+        n_mels=args.n_mels,
+        n_fft=args.n_fft,
+        hop_length=args.hop_length,
+        win_length=args.win_length,
+        lstm_hidden_size=args.lstm_hidden_size,
+        lstm_num_layers=args.lstm_num_layers,
+        dropout=args.dropout,
+    )
+
+    logger = WandbLogger(
+        project=args.wandb_project,
+        name=args.wandb_run_name,
+        save_dir=str(args.wandb_save_dir),
+        log_model=False,
+    )
+
+    trainer = L.Trainer(
+        accelerator=args.accelerator,
+        devices=args.devices,
+        max_epochs=args.max_epochs,
+        precision=args.precision,
+        deterministic=False,
+        log_every_n_steps=10,
+        logger=logger,
+    )
+    trainer.fit(model=model, datamodule=datamodule)
+
+
+if __name__ == "__main__":
+    main()

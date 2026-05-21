@@ -12,14 +12,17 @@ dependencies = [
   "torch>=2.4",
   "torchaudio>=2.4",
   "lightning>=2.2,<3.0",
+  "wandb>=0.17",
   "PyYAML>=6.0",
   "pandas>=2.2",
+  "scipy>=1.13",
   "scikit-learn>=1.5",
   "torchmetrics>=1.4",
 ]
 
 [project.scripts]
 domestic-sed-eval = "domestic_sed.evaluation:main"
+domestic-sed-train = "domestic_sed.training:main"
 
 [project.optional-dependencies]
 dev = [
