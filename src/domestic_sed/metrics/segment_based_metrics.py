@@ -9,7 +9,6 @@ from typing import Iterable
 
 import pandas as pd
 from sklearn.metrics import f1_score, precision_score, recall_score, average_precision_score
-from torch.optim.optimizer import required
 
 REQUIRED_COLUMNS = {"filename", "annotation", "onset", "offset"}
 CLASS_NAMES = {'toilet_flushing', 'coffee_machine', 'running_water', 'cutlery_dishes', 'window_open_close', 'wardrobe_drawer_open_close', 'keychain', 'keyboard_typing', 'footsteps', 'vacuum_cleaner', 'bell_ringing', 'light_switch', 'door_open_close', 'microwave', 'phone_ringing'}
@@ -57,7 +56,7 @@ def evaluate_prediction_csvs(
     prediction_csv: str | Path,
     *,
     audio_dir: str | Path | None = None,
-) -> tuple[pd.DataFrame, float]:
+) -> tuple[float, pd.DataFrame]:
     """Evaluate predictions against ground truth CSVs, optionally validating audio bounds."""
 
     print("Loading ground truth... ")
@@ -71,6 +70,7 @@ def evaluate_prediction_csvs(
 
     ground_truth_segments = build_segment_frame_from_intervals(ground_truth, name="ground_truth")
     prediction_segments = build_segment_frame_from_intervals(predictions, name="predictions")
+
     return calculate_f1_score(ground_truth_segments, prediction_segments)
 
 
@@ -113,10 +113,13 @@ def load_annotation_csv(path: str | Path, ground_truth=False, audio_dir=None) ->
                     "prediction is outside of waveform support: "
                     f"{row['filename']}, {row['annotation']}, {row['onset']}, {row['offset']}"
                 )
+            if row['onset'] < 0 or row['offset'] < 0:
+                raise ValueError(
+                    "onset and offset must be positive"
+                    f"{row['filename']}, {row['annotation']}, {row['onset']}, {row['offset']}"
+                )
 
     return df
-
-
 
 def calculate_f1_score(
     ground_truth_segments: pd.DataFrame,
@@ -177,8 +180,6 @@ def calculate_map_score(
         map = average_precision_score(gt_values, pred_values, zero_division=0.0)
         pred_values = pred_values > 0.5
 
-        gt_values = float(ground_truth_segments.get(annotation, pd.Series(0, index=combined_index, dtype=int)))
-        pred_values = float(prediction_segments.get(annotation, pd.Series(0, index=combined_index, dtype=int)))
         precision = float(precision_score(gt_values, pred_values, zero_division=0.0))
         recall = float(recall_score(gt_values, pred_values, zero_division=0.0))
         f1 = float(f1_score(gt_values, pred_values, zero_division=0.0))
