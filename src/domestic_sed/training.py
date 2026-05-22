@@ -12,7 +12,7 @@ from lightning.pytorch.loggers import WandbLogger
 from torch import nn
 from torch.utils.data import DataLoader
 
-from domestic_sed.architectures import CRNN, CRNNBlockConfig
+from domestic_sed.architectures import CRNN, CRNNBlockConfig, build_default_crnn_blocks
 from domestic_sed.dataset import MLPC2026SoundEventDataset
 from domestic_sed.metrics.segment_based_metrics import (
     SEGMENT_SECONDS,
@@ -31,21 +31,7 @@ MIN_INPUT_SAMPLE_RATE = DEFAULT_SAMPLE_RATE
 
 
 def _default_crnn_blocks() -> list[CRNNBlockConfig]:
-    return [
-            CRNNBlockConfig(out_channels=1, conv_kernel_size=(5, 5), conv_stride=(2,2), pool_kernel_size=(1, 1)),
-
-            CRNNBlockConfig(out_channels=64, conv_kernel_size=(3, 3), conv_stride=(1, 1), pool_kernel_size=(1, 1)),
-            CRNNBlockConfig(out_channels=64, conv_kernel_size=(3, 3), conv_stride=(1, 1), pool_kernel_size=(2, 2)),
-
-            CRNNBlockConfig(out_channels=128, conv_kernel_size=(3, 3), conv_stride=(1, 1), pool_kernel_size=(1, 1)),
-            CRNNBlockConfig(out_channels=128, conv_kernel_size=(3, 3), conv_stride=(1, 1), pool_kernel_size=(2, 2)),
-
-            CRNNBlockConfig(out_channels=256, conv_kernel_size=(3, 3), conv_stride=(1, 1), pool_kernel_size=(1, 1)),
-            CRNNBlockConfig(out_channels=256, conv_kernel_size=(3, 3), conv_stride=(1, 1), pool_kernel_size=(2, 2)),
-
-            CRNNBlockConfig(out_channels=512, conv_kernel_size=(3, 3), conv_stride=(1, 1), pool_kernel_size=(1, 1)),
-            CRNNBlockConfig(out_channels=512, conv_kernel_size=(3, 3), conv_stride=(1, 1), pool_kernel_size=(1, 1))
-        ]
+    return build_default_crnn_blocks(p1=1, p2=1)
 
 
 def _waveform_to_mono(waveform: torch.Tensor) -> torch.Tensor:
