@@ -13,7 +13,7 @@ from sklearn.metrics import f1_score, precision_score, recall_score, average_pre
 REQUIRED_COLUMNS = {"filename", "annotation", "onset", "offset"}
 CLASS_NAMES = {'toilet_flushing', 'coffee_machine', 'running_water', 'cutlery_dishes', 'window_open_close', 'wardrobe_drawer_open_close', 'keychain', 'keyboard_typing', 'footsteps', 'vacuum_cleaner', 'bell_ringing', 'light_switch', 'door_open_close', 'microwave', 'phone_ringing'}
 
-SEGMENT_SECONDS = 0.5
+SEGMENT_SECONDS = 1.0
 
 
 @dataclass(frozen=True)
@@ -200,7 +200,7 @@ def build_segment_frame_from_intervals(
     *,
     name: str,
 ) -> pd.DataFrame:
-    """Expand interval annotations into a 0.5 s multi-hot segment frame."""
+    """Expand interval annotations into multi-hot segment frame."""
 
     def _iter_segments(onset: float, offset: float) -> Iterable[float]:
         if offset <= onset:
@@ -212,8 +212,8 @@ def build_segment_frame_from_intervals(
     rows: list[dict[str, object]] = []
     for record in df.itertuples(index=False):
         # round to half seconds
-        onset = round(float(record.onset) * (1/SEGMENT_SECONDS)) / 2
-        offset = round(float(record.offset) * (1/SEGMENT_SECONDS)) / 2
+        onset = math.floor(float(record.onset) * (1/SEGMENT_SECONDS)) / (1/SEGMENT_SECONDS)
+        offset = math.ceil(float(record.offset) * (1/SEGMENT_SECONDS)) / (1/SEGMENT_SECONDS)
 
         for segment_start in _iter_segments(onset, offset):
             rows.append(
