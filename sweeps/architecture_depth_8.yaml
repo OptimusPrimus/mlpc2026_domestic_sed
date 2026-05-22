@@ -1,0 +1,27 @@
+program: src/domestic_sed/training.py
+name: architecture-depth-8-max-epochs-lr
+method: bayes
+metric:
+  name: val/map
+  goal: maximize
+parameters:
+  architecture-depth:
+    value: 8
+  max-epochs:
+    values: [50, 75, 100]
+  learning-rate:
+    distribution: log_uniform_values
+    min: !!float 1e-4
+    max: !!float 1e-2
+  lr-linear-decay-epochs:
+    distribution: int_uniform
+    min: 0
+    max: 30
+  early-stopping-patience:
+    value: 10
+command:
+  - ${env}
+  - python
+  - -c
+  - "import sys; sys.path.insert(0, 'src'); from domestic_sed.training import main; main()"
+  - ${args_no_boolean_flags}

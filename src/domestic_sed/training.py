@@ -8,6 +8,7 @@ import lightning as L
 import pandas as pd
 import torch
 import torchaudio
+from lightning.pytorch.callbacks import EarlyStopping
 from lightning.pytorch.loggers import WandbLogger
 from torch import nn
 from torch.utils.data import DataLoader
@@ -185,6 +186,8 @@ class SoundEventLightningModule(L.LightningModule):
         class_to_index: dict[str, int],
         learning_rate: float,
         weight_decay: float = 0.0,
+        lr_linear_decay_epochs: int = 0,
+        max_epochs: int = 30,
         sample_rate: int = DEFAULT_SAMPLE_RATE,
         n_mels: int = DEFAULT_MEL_BINS,
         n_fft: int = DEFAULT_N_FFT,
@@ -205,6 +208,8 @@ class SoundEventLightningModule(L.LightningModule):
         self.num_classes = len(class_to_index)
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
+        self.lr_linear_decay_epochs = lr_linear_decay_epochs
+        self.max_epochs = max_epochs
         self.hop_length = hop_length
         self.augmentation_config = augmentation_config or SpectrogramAugmentationConfig()
         self.class_names_by_index = [class_name for class_name, _ in sorted(class_to_index.items(), key=lambda item: item[1])]
@@ -344,12 +349,36 @@ class SoundEventLightningModule(L.LightningModule):
         macro_map, _ = calculate_map_score(ground_truth_segments, prediction_segments)
         self.log("val/map", macro_map, prog_bar=True, on_step=False, on_epoch=True, sync_dist=False)
 
-    def configure_optimizers(self) -> torch.optim.Optimizer:
-        return torch.optim.AdamW(
+    def _lr_decay_factor(self, epoch: int) -> float:
+        if self.lr_linear_decay_epochs <= 0:
+            return 1.0
+        decay_epochs = min(self.lr_linear_decay_epochs, self.max_epochs)
+        decay_start_epoch = self.max_epochs - decay_epochs
+        if epoch < decay_start_epoch:
+            return 1.0
+        remaining_epochs = self.max_epochs - epoch
+        return max(0.0, remaining_epochs / decay_epochs)
+
+    def configure_optimizers(self) -> dict[str, Any] | torch.optim.Optimizer:
+        optimizer = torch.optim.AdamW(
             self.parameters(),
             lr=self.learning_rate,
             weight_decay=self.weight_decay,
         )
+        if self.lr_linear_decay_epochs <= 0:
+            return optimizer
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer,
+            lr_lambda=self._lr_decay_factor,
+        )
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "epoch",
+                "frequency": 1,
+            },
+        }
 
     def _waveform_to_features(self, waveform: torch.Tensor) -> torch.Tensor:
         spectrogram = self.mel_transform(waveform)
@@ -520,11 +549,23 @@ class SoundEventLightningModule(L.LightningModule):
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train a CRNN sound event detection model.")
     parser.add_argument("--data-root", type=Path, help="Dataset root containing the train split.", default="/home/paul/data/mlpc2026_dataset/MLPC2026_challenge_dataset_raw/")
-    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--max-epochs", type=int, default=30)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=0.0)
+    parser.add_argument(
+        "--lr-linear-decay-epochs",
+        type=int,
+        default=0,
+        help="Linearly decay the learning rate to zero over the last N epochs of training.",
+    )
+    parser.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        default=None,
+        help="Stop training if val/map does not improve for this many validation epochs.",
+    )
     parser.add_argument("--sample-rate", type=int, default=DEFAULT_SAMPLE_RATE)
     parser.add_argument("--max-duration-seconds", type=float, default=DEFAULT_MAX_DURATION_SECONDS)
     parser.add_argument("--n-mels", type=int, default=DEFAULT_MEL_BINS)
@@ -625,6 +666,8 @@ def main() -> None:
         class_to_index=datamodule.class_to_index,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
+        lr_linear_decay_epochs=args.lr_linear_decay_epochs,
+        max_epochs=args.max_epochs,
         sample_rate=args.sample_rate,
         n_mels=args.n_mels,
         n_fft=args.n_fft,
@@ -647,6 +690,16 @@ def main() -> None:
         log_model=False,
     )
 
+    callbacks = []
+    if args.early_stopping_patience is not None:
+        callbacks.append(
+            EarlyStopping(
+                monitor="val/map",
+                mode="max",
+                patience=args.early_stopping_patience,
+            )
+        )
+
     trainer = L.Trainer(
         accelerator=args.accelerator,
         devices=args.devices,
@@ -655,6 +708,7 @@ def main() -> None:
         deterministic=False,
         log_every_n_steps=10,
         logger=logger,
+        callbacks=callbacks,
     )
     trainer.fit(model=model, datamodule=datamodule)
 
