@@ -12,6 +12,15 @@ from lightning.pytorch.loggers import WandbLogger
 from torch import nn
 from torch.utils.data import DataLoader
 
+from domestic_sed.augmentations import (
+    RandomResizeCrop,
+    SpectrogramAugmentationConfig,
+    filter_augmentation,
+    frame_shift,
+    mixstyle,
+    mixup,
+    time_mask,
+)
 from domestic_sed.architectures import CRNN, CRNNBlockConfig, build_default_crnn_blocks
 from domestic_sed.dataset import MLPC2026SoundEventDataset
 from domestic_sed.metrics.segment_based_metrics import (
@@ -30,8 +39,19 @@ DEFAULT_MAX_DURATION_SECONDS = 35.0
 MIN_INPUT_SAMPLE_RATE = DEFAULT_SAMPLE_RATE
 
 
-def _default_crnn_blocks() -> list[CRNNBlockConfig]:
-    return build_default_crnn_blocks(p1=1, p2=1)
+def _default_crnn_blocks(
+    *,
+    p1: int = 5,
+    p2: int = 5,
+    depth: int = 12,
+    channel_multiplier: int = 1,
+) -> list[CRNNBlockConfig]:
+    return build_default_crnn_blocks(
+        p1=p1,
+        p2=p2,
+        depth=depth,
+        channel_multiplier=channel_multiplier,
+    )
 
 
 def _waveform_to_mono(waveform: torch.Tensor) -> torch.Tensor:
@@ -164,6 +184,7 @@ class SoundEventLightningModule(L.LightningModule):
         *,
         class_to_index: dict[str, int],
         learning_rate: float,
+        weight_decay: float = 0.0,
         sample_rate: int = DEFAULT_SAMPLE_RATE,
         n_mels: int = DEFAULT_MEL_BINS,
         n_fft: int = DEFAULT_N_FFT,
@@ -172,13 +193,20 @@ class SoundEventLightningModule(L.LightningModule):
         lstm_hidden_size: int = 256,
         lstm_num_layers: int = 2,
         dropout: float = 0.2,
+        architecture_p1: int = 5,
+        architecture_p2: int = 5,
+        architecture_depth: int = 12,
+        architecture_base_multiplier: int = 1,
+        augmentation_config: SpectrogramAugmentationConfig | None = None,
     ) -> None:
         super().__init__()
         self.save_hyperparameters(ignore=["class_to_index"])
         self.class_to_index = class_to_index
         self.num_classes = len(class_to_index)
         self.learning_rate = learning_rate
+        self.weight_decay = weight_decay
         self.hop_length = hop_length
+        self.augmentation_config = augmentation_config or SpectrogramAugmentationConfig()
         self.class_names_by_index = [class_name for class_name, _ in sorted(class_to_index.items(), key=lambda item: item[1])]
         self.validation_predictions: list[dict[str, Any]] = []
 
@@ -196,8 +224,18 @@ class SoundEventLightningModule(L.LightningModule):
             mel_scale="slaney",
         )
         self.amplitude_to_db = torchaudio.transforms.AmplitudeToDB(stype="power", top_db=80.0)
+        self.freq_warp = RandomResizeCrop(
+            virtual_crop_scale=self.augmentation_config.freq_warp_virtual_crop_scale,
+            freq_scale=self.augmentation_config.freq_warp_freq_scale,
+            time_scale=self.augmentation_config.freq_warp_time_scale,
+        )
         self.model = CRNN(
-            conv_blocks=_default_crnn_blocks(),
+            conv_blocks=_default_crnn_blocks(
+                p1=architecture_p1,
+                p2=architecture_p2,
+                depth=architecture_depth,
+                channel_multiplier=architecture_base_multiplier,
+            ),
             input_bins=n_mels,
             lstm_hidden_size=lstm_hidden_size,
             lstm_num_layers=lstm_num_layers,
@@ -207,28 +245,56 @@ class SoundEventLightningModule(L.LightningModule):
         )
 
     def forward(self, waveform: torch.Tensor) -> torch.Tensor:
-        spectrogram = self.mel_transform(waveform)
-        spectrogram = self.amplitude_to_db(spectrogram)
-        return self.model(spectrogram)
+        return self.model(self._waveform_to_features(waveform))
 
     def training_step(self, batch: dict[str, Any], batch_idx: int) -> torch.Tensor:
         del batch_idx
-        logits = self(batch["waveform"])
-        loss, _, _ = self._compute_loss(
-            logits=logits,
+        spectrogram = self._waveform_to_features(batch["waveform"])
+        output_frames = self.model.output_shape(spectrogram.shape[-1])[0]
+        targets = self._build_targets(
             annotations_batch=batch["annotations"],
             audio_num_samples=batch["audio_num_samples"],
+            output_frames=output_frames,
+            device=spectrogram.device,
+            dtype=spectrogram.dtype,
+        )
+        loss_mask = self._build_loss_mask(
+            audio_num_samples=batch["audio_num_samples"],
+            output_frames=output_frames,
+            device=spectrogram.device,
+            dtype=spectrogram.dtype,
+        )
+        spectrogram, targets = self._apply_training_augmentations(spectrogram, targets)
+        logits = self.model(spectrogram)
+        loss = self._compute_loss_from_targets(
+            logits=logits,
+            targets=targets,
+            loss_mask=loss_mask,
         )
         self.log("train/loss", loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=logits.shape[0])
         return loss
 
     def validation_step(self, batch: dict[str, Any], batch_idx: int) -> torch.Tensor:
         del batch_idx
-        logits = self(batch["waveform"])
-        loss, targets, loss_mask = self._compute_loss(
-            logits=logits,
+        spectrogram = self._waveform_to_features(batch["waveform"])
+        logits = self.model(spectrogram)
+        targets = self._build_targets(
             annotations_batch=batch["annotations"],
             audio_num_samples=batch["audio_num_samples"],
+            output_frames=logits.shape[1],
+            device=logits.device,
+            dtype=logits.dtype,
+        )
+        loss_mask = self._build_loss_mask(
+            audio_num_samples=batch["audio_num_samples"],
+            output_frames=logits.shape[1],
+            device=logits.device,
+            dtype=logits.dtype,
+        )
+        loss = self._compute_loss_from_targets(
+            logits=logits,
+            targets=targets,
+            loss_mask=loss_mask,
         )
         probabilities = torch.sigmoid(logits)
         valid_output_frames = loss_mask[:, 0, :].sum(dim=1).to(dtype=torch.long)
@@ -279,35 +345,79 @@ class SoundEventLightningModule(L.LightningModule):
         self.log("val/map", macro_map, prog_bar=True, on_step=False, on_epoch=True, sync_dist=False)
 
     def configure_optimizers(self) -> torch.optim.Optimizer:
-        return torch.optim.Adam(self.parameters(), lr=self.learning_rate)
+        return torch.optim.AdamW(
+            self.parameters(),
+            lr=self.learning_rate,
+            weight_decay=self.weight_decay,
+        )
 
-    def _compute_loss(
+    def _waveform_to_features(self, waveform: torch.Tensor) -> torch.Tensor:
+        spectrogram = self.mel_transform(waveform)
+        return self.amplitude_to_db(spectrogram)
+
+    def _apply_training_augmentations(
+        self,
+        spectrogram: torch.Tensor,
+        targets: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        config = self.augmentation_config
+        augmented_spectrogram = spectrogram
+        augmented_targets = targets
+
+        if config.frame_shift_range > 0.0:
+            augmented_spectrogram, augmented_targets = frame_shift(
+                augmented_spectrogram,
+                augmented_targets,
+                shift_range=config.frame_shift_range,
+            )
+
+        if config.mixup_p > 0.0 and torch.rand(1).item() < config.mixup_p:
+            augmented_spectrogram, augmented_targets = mixup(
+                augmented_spectrogram,
+                targets=augmented_targets,
+                alpha=config.mixup_alpha,
+                beta=config.mixup_beta,
+            )
+
+        if config.mixstyle_p > 0.0 and torch.rand(1).item() < config.mixstyle_p:
+            augmented_spectrogram = mixstyle(
+                augmented_spectrogram,
+                alpha=config.mixstyle_alpha,
+            )
+
+        if config.max_time_mask_size > 0.0:
+            augmented_spectrogram, augmented_targets = time_mask(
+                augmented_spectrogram,
+                augmented_targets,
+                max_mask_ratio=config.max_time_mask_size,
+            )
+
+        if config.filter_augment_p > 0.0 and torch.rand(1).item() < config.filter_augment_p:
+            augmented_spectrogram = filter_augmentation(
+                augmented_spectrogram,
+                filter_db_range=(config.filter_db_range_min, config.filter_db_range_max),
+                filter_bands=(config.filter_bands_min, config.filter_bands_max),
+                filter_minimum_bandwidth=config.filter_minimum_bandwidth,
+            )
+
+        if config.freq_warp_p > 0.0 and torch.rand(1).item() < config.freq_warp_p:
+            augmented_spectrogram = self.freq_warp(augmented_spectrogram.squeeze(1)).unsqueeze(1)
+
+        return augmented_spectrogram, augmented_targets
+
+    def _compute_loss_from_targets(
         self,
         *,
         logits: torch.Tensor,
-        annotations_batch: list[pd.DataFrame],
-        audio_num_samples: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        targets = self._build_targets(
-            annotations_batch=annotations_batch,
-            audio_num_samples=audio_num_samples,
-            output_frames=logits.shape[1],
-            device=logits.device,
-            dtype=logits.dtype,
-        )
-        loss_mask = self._build_loss_mask(
-            audio_num_samples=audio_num_samples,
-            output_frames=logits.shape[1],
-            device=logits.device,
-            dtype=logits.dtype,
-        )
+        targets: torch.Tensor,
+        loss_mask: torch.Tensor,
+    ) -> torch.Tensor:
         per_frame_loss = nn.functional.binary_cross_entropy_with_logits(
             logits.transpose(1, 2),
             targets,
             reduction="none",
         )
-        loss = (per_frame_loss * loss_mask).sum() / loss_mask.sum().clamp_min(1.0)
-        return loss, targets, loss_mask
+        return (per_frame_loss * loss_mask).sum() / loss_mask.sum().clamp_min(1.0)
 
     def _build_loss_mask(
         self,
@@ -414,6 +524,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--max-epochs", type=int, default=30)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument("--sample-rate", type=int, default=DEFAULT_SAMPLE_RATE)
     parser.add_argument("--max-duration-seconds", type=float, default=DEFAULT_MAX_DURATION_SECONDS)
     parser.add_argument("--n-mels", type=int, default=DEFAULT_MEL_BINS)
@@ -423,6 +534,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lstm-hidden-size", type=int, default=256)
     parser.add_argument("--lstm-num-layers", type=int, default=2)
     parser.add_argument("--dropout", type=float, default=0.2)
+    parser.add_argument("--architecture-p1", type=int, default=5)
+    parser.add_argument("--architecture-p2", type=int, default=5)
+    parser.add_argument("--architecture-depth", type=int, default=12)
+    parser.add_argument("--architecture-base-multiplier", type=int, default=1)
+    parser.add_argument("--augmentation-frame-shift-range", type=float, default=0.0)
+    parser.add_argument("--augmentation-mixup-p", type=float, default=0.0)
+    parser.add_argument("--augmentation-mixup-alpha", type=float, default=0.2)
+    parser.add_argument("--augmentation-mixup-beta", type=float, default=0.2)
+    parser.add_argument("--augmentation-mixstyle-p", type=float, default=0.0)
+    parser.add_argument("--augmentation-mixstyle-alpha", type=float, default=0.4)
+    parser.add_argument("--augmentation-max-time-mask-size", type=float, default=0.0)
+    parser.add_argument("--augmentation-filter-p", type=float, default=0.0)
+    parser.add_argument("--augmentation-filter-db-min", type=float, default=-6.0)
+    parser.add_argument("--augmentation-filter-db-max", type=float, default=6.0)
+    parser.add_argument("--augmentation-filter-bands-min", type=int, default=3)
+    parser.add_argument("--augmentation-filter-bands-max", type=int, default=6)
+    parser.add_argument("--augmentation-filter-min-bandwidth", type=int, default=6)
+    parser.add_argument("--augmentation-freq-warp-p", type=float, default=0.0)
+    parser.add_argument("--augmentation-freq-warp-virtual-scale-freq", type=float, default=1.0)
+    parser.add_argument("--augmentation-freq-warp-virtual-scale-time", type=float, default=1.5)
+    parser.add_argument("--augmentation-freq-warp-freq-scale-min", type=float, default=1.0)
+    parser.add_argument("--augmentation-freq-warp-freq-scale-max", type=float, default=1.0)
+    parser.add_argument("--augmentation-freq-warp-time-scale-min", type=float, default=1.0)
+    parser.add_argument("--augmentation-freq-warp-time-scale-max", type=float, default=1.0)
     parser.add_argument(
         "--class-names",
         type=str,
@@ -447,6 +582,35 @@ def main() -> None:
     if args.class_names:
         initial_class_names = [name.strip() for name in args.class_names.split(",") if name.strip()]
 
+    augmentation_config = SpectrogramAugmentationConfig(
+        frame_shift_range=args.augmentation_frame_shift_range,
+        mixup_p=args.augmentation_mixup_p,
+        mixup_alpha=args.augmentation_mixup_alpha,
+        mixup_beta=args.augmentation_mixup_beta,
+        mixstyle_p=args.augmentation_mixstyle_p,
+        mixstyle_alpha=args.augmentation_mixstyle_alpha,
+        max_time_mask_size=args.augmentation_max_time_mask_size,
+        filter_augment_p=args.augmentation_filter_p,
+        filter_db_range_min=args.augmentation_filter_db_min,
+        filter_db_range_max=args.augmentation_filter_db_max,
+        filter_bands_min=args.augmentation_filter_bands_min,
+        filter_bands_max=args.augmentation_filter_bands_max,
+        filter_minimum_bandwidth=args.augmentation_filter_min_bandwidth,
+        freq_warp_p=args.augmentation_freq_warp_p,
+        freq_warp_virtual_crop_scale=(
+            args.augmentation_freq_warp_virtual_scale_freq,
+            args.augmentation_freq_warp_virtual_scale_time,
+        ),
+        freq_warp_freq_scale=(
+            args.augmentation_freq_warp_freq_scale_min,
+            args.augmentation_freq_warp_freq_scale_max,
+        ),
+        freq_warp_time_scale=(
+            args.augmentation_freq_warp_time_scale_min,
+            args.augmentation_freq_warp_time_scale_max,
+        ),
+    )
+
     datamodule = SoundEventDataModule(
         data_root=args.data_root,
         batch_size=args.batch_size,
@@ -460,6 +624,7 @@ def main() -> None:
     model = SoundEventLightningModule(
         class_to_index=datamodule.class_to_index,
         learning_rate=args.learning_rate,
+        weight_decay=args.weight_decay,
         sample_rate=args.sample_rate,
         n_mels=args.n_mels,
         n_fft=args.n_fft,
@@ -468,6 +633,11 @@ def main() -> None:
         lstm_hidden_size=args.lstm_hidden_size,
         lstm_num_layers=args.lstm_num_layers,
         dropout=args.dropout,
+        architecture_p1=args.architecture_p1,
+        architecture_p2=args.architecture_p2,
+        architecture_depth=args.architecture_depth,
+        architecture_base_multiplier=args.architecture_base_multiplier,
+        augmentation_config=augmentation_config,
     )
 
     logger = WandbLogger(

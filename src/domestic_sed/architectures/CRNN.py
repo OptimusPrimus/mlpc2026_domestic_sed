@@ -46,15 +46,24 @@ class CRNNSummaryEntry:
     effective_stride: tuple[int, int]
 
 
-def build_default_crnn_blocks(p1: int, p2: int) -> list[CRNNBlockConfig]:
+def build_default_crnn_blocks(
+    p1: int = 6,
+    p2: int = 6,
+    *,
+    channel_multiplier: int = 4,
+    depth: int = 12,
+) -> list[CRNNBlockConfig]:
     if p1 < 0 or p2 < 0:
         raise ValueError("p1 and p2 must be non-negative")
+    if channel_multiplier <= 0:
+        raise ValueError("channel_multiplier must be positive")
+    if depth <= 0:
+        raise ValueError("depth must be positive")
 
-    channels = [64, 64, 128, 128, 256, 256, 512]
     pooling_blocks = {1, 2, 4}
-    blocks = [
+    blocks: list[CRNNBlockConfig] = [
         CRNNBlockConfig(
-            out_channels=channels[0],
+            out_channels=32 * channel_multiplier,
             conv1_kernel_size=(3, 3),
             conv2_kernel_size=(1, 1),
             pool_kernel_size=(2, 2),
@@ -62,10 +71,18 @@ def build_default_crnn_blocks(p1: int, p2: int) -> list[CRNNBlockConfig]:
         )
     ]
 
-    for block_index, out_channels in enumerate(channels[1:], start=1):
-        conv1_index = (2 * block_index) - 1
-        conv2_index = 2 * block_index
-        pool_kernel_size = (2, 2) if (block_index + 1) in pooling_blocks else None
+    for block_number in range(2, depth + 1):
+        if block_number <= 4:
+            out_channels = 32 * channel_multiplier
+        elif block_number <= 8:
+            out_channels = 64 * channel_multiplier
+        else:
+            out_channels = 128 * channel_multiplier
+
+        configurable_block_index = block_number - 1
+        conv1_index = (2 * configurable_block_index) - 1
+        conv2_index = 2 * configurable_block_index
+        pool_kernel_size = (2, 2) if block_number in pooling_blocks else None
         blocks.append(
             CRNNBlockConfig(
                 out_channels=out_channels,
