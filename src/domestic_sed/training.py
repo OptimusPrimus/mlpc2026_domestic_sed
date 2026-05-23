@@ -8,7 +8,7 @@ import lightning as L
 import pandas as pd
 import torch
 import torchaudio
-from lightning.pytorch.callbacks import EarlyStopping
+from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor
 from lightning.pytorch.loggers import WandbLogger
 from torch import nn
 from torch.utils.data import DataLoader
@@ -578,7 +578,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--architecture-p1", type=int, default=5)
     parser.add_argument("--architecture-p2", type=int, default=5)
     parser.add_argument("--architecture-depth", type=int, default=12)
-    parser.add_argument("--architecture-base-multiplier", type=int, default=1)
+    parser.add_argument("--architecture-base-multiplier", type=int, default=4)
     parser.add_argument("--augmentation-frame-shift-range", type=float, default=0.0)
     parser.add_argument("--augmentation-mixup-p", type=float, default=0.0)
     parser.add_argument("--augmentation-mixup-alpha", type=float, default=0.2)
@@ -613,6 +613,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--wandb-run-name", type=str, default=None)
     parser.add_argument("--wandb-save-dir", type=Path, default=Path("wandb"))
     return parser
+
+
+def build_callbacks(*, early_stopping_patience: int | None) -> list[L.Callback]:
+    callbacks: list[L.Callback] = [LearningRateMonitor(logging_interval="epoch")]
+    if early_stopping_patience is not None:
+        callbacks.append(
+            EarlyStopping(
+                monitor="val/map",
+                mode="max",
+                patience=early_stopping_patience,
+            )
+        )
+    return callbacks
 
 
 def main() -> None:
@@ -690,16 +703,6 @@ def main() -> None:
         log_model=False,
     )
 
-    callbacks = []
-    if args.early_stopping_patience is not None:
-        callbacks.append(
-            EarlyStopping(
-                monitor="val/map",
-                mode="max",
-                patience=args.early_stopping_patience,
-            )
-        )
-
     trainer = L.Trainer(
         accelerator=args.accelerator,
         devices=args.devices,
@@ -708,7 +711,7 @@ def main() -> None:
         deterministic=False,
         log_every_n_steps=10,
         logger=logger,
-        callbacks=callbacks,
+        callbacks=build_callbacks(early_stopping_patience=args.early_stopping_patience),
     )
     trainer.fit(model=model, datamodule=datamodule)
 
