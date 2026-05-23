@@ -578,7 +578,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--architecture-p1", type=int, default=5)
     parser.add_argument("--architecture-p2", type=int, default=5)
     parser.add_argument("--architecture-depth", type=int, default=12)
-    parser.add_argument("--architecture-base-multiplier", type=int, default=4)
+    parser.add_argument("--architecture-base-multiplier", type=int, default=2)
     parser.add_argument("--augmentation-frame-shift-range", type=float, default=0.0)
     parser.add_argument("--augmentation-mixup-p", type=float, default=0.0)
     parser.add_argument("--augmentation-mixup-alpha", type=float, default=0.2)
