@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import secrets
 from pathlib import Path
 from typing import Any
 
@@ -25,7 +26,6 @@ from domestic_sed.augmentations import (
 from domestic_sed.architectures import CRNN, CRNNBlockConfig, build_default_crnn_blocks
 from domestic_sed.dataset import MLPC2026SoundEventDataset
 from domestic_sed.metrics.segment_based_metrics import (
-    SEGMENT_SECONDS,
     build_segment_frame_from_intervals,
     calculate_map_score,
 )
@@ -38,6 +38,12 @@ DEFAULT_HOP_LENGTH = 512
 DEFAULT_WIN_LENGTH = 2048
 DEFAULT_MAX_DURATION_SECONDS = 35.0
 MIN_INPUT_SAMPLE_RATE = DEFAULT_SAMPLE_RATE
+
+
+def _resolve_seed(seed: int | None) -> int:
+    if seed is not None:
+        return seed
+    return secrets.randbelow(2**32)
 
 
 def _default_crnn_blocks(
@@ -346,8 +352,17 @@ class SoundEventLightningModule(L.LightningModule):
         else:
             prediction_segments = pd.DataFrame()
 
-        macro_map, _ = calculate_map_score(ground_truth_segments, prediction_segments)
+        macro_map, per_class_map = calculate_map_score(ground_truth_segments, prediction_segments)
         self.log("val/map", macro_map, prog_bar=True, on_step=False, on_epoch=True, sync_dist=False)
+        for row in per_class_map.itertuples(index=False):
+            self.log(
+                f"val_class/map_{row.annotation}",
+                row.map,
+                prog_bar=False,
+                on_step=False,
+                on_epoch=True,
+                sync_dist=False,
+            )
 
     def _lr_decay_factor(self, epoch: int) -> float:
         if self.lr_linear_decay_epochs <= 0:
@@ -514,7 +529,11 @@ class SoundEventLightningModule(L.LightningModule):
     def _num_spectrogram_frames(self, num_samples: int) -> int:
         return 1 + max(0, num_samples // self.hparams.hop_length)
 
-    def _prediction_segments_to_frame(self, prediction: dict[str, Any]) -> pd.DataFrame:
+    def _prediction_segments_to_frame(
+        self,
+        prediction: dict[str, Any],
+        segment_duration_seconds: float = 1.0,
+    ) -> pd.DataFrame:
         clip_duration_seconds = prediction["audio_num_samples"] / self.hparams.sample_rate
         valid_output_frames = prediction["valid_output_frames"]
         probabilities: torch.Tensor = prediction["probabilities"][:valid_output_frames]
@@ -523,11 +542,11 @@ class SoundEventLightningModule(L.LightningModule):
             empty_index = pd.MultiIndex.from_tuples([], names=["filename", "segment_start"])
             return pd.DataFrame(columns=self.class_names_by_index, index=empty_index)
 
-        num_segments = max(1, int(torch.ceil(torch.tensor(clip_duration_seconds / SEGMENT_SECONDS)).item()))
+        num_segments = max(1, int(torch.ceil(torch.tensor(clip_duration_seconds / segment_duration_seconds)).item()))
         rows: list[dict[str, float | str]] = []
         for segment_index in range(num_segments):
-            segment_start = segment_index * SEGMENT_SECONDS
-            segment_end = min(segment_start + SEGMENT_SECONDS, clip_duration_seconds)
+            segment_start = segment_index * segment_duration_seconds
+            segment_end = min(segment_start + segment_duration_seconds, clip_duration_seconds)
             frame_start = int(segment_start / clip_duration_seconds * valid_output_frames)
             frame_end = int(torch.ceil(torch.tensor(segment_end / clip_duration_seconds * valid_output_frames)).item())
             frame_start = max(0, min(frame_start, valid_output_frames - 1))
@@ -578,7 +597,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--architecture-p1", type=int, default=5)
     parser.add_argument("--architecture-p2", type=int, default=5)
     parser.add_argument("--architecture-depth", type=int, default=12)
-    parser.add_argument("--architecture-base-multiplier", type=int, default=3)
+    parser.add_argument("--architecture-base-multiplier", type=int, default=2)
     parser.add_argument("--augmentation-frame-shift-range", type=float, default=0.0)
     parser.add_argument("--augmentation-mixup-p", type=float, default=0.0)
     parser.add_argument("--augmentation-mixup-alpha", type=float, default=0.2)
@@ -608,7 +627,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--accelerator", type=str, default="auto")
     parser.add_argument("--devices", type=str, default="auto")
     parser.add_argument("--precision", type=str, default="32-true")
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed. If omitted, choose a random seed for this run.",
+    )
     parser.add_argument("--wandb-project", type=str, default="domestic-sed")
     parser.add_argument("--wandb-run-name", type=str, default=None)
     parser.add_argument("--wandb-save-dir", type=Path, default=Path("wandb"))
@@ -630,6 +654,7 @@ def build_callbacks(*, early_stopping_patience: int | None) -> list[L.Callback]:
 
 def main() -> None:
     args = build_arg_parser().parse_args()
+    args.seed = _resolve_seed(args.seed)
     L.seed_everything(args.seed, workers=True)
 
     initial_class_names = None

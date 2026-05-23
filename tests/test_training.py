@@ -1,7 +1,8 @@
+import pandas as pd
 import torch
 from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor
 
-from domestic_sed.training import SoundEventLightningModule, build_arg_parser, build_callbacks
+from domestic_sed.training import SoundEventLightningModule, _resolve_seed, build_arg_parser, build_callbacks
 
 
 def test_build_arg_parser_accepts_lr_linear_decay_epochs() -> None:
@@ -14,6 +15,16 @@ def test_build_arg_parser_accepts_early_stopping_patience() -> None:
     args = build_arg_parser().parse_args(["--early-stopping-patience", "10"])
 
     assert args.early_stopping_patience == 10
+
+
+def test_build_arg_parser_defaults_to_random_seed() -> None:
+    args = build_arg_parser().parse_args([])
+
+    assert args.seed is None
+
+
+def test_resolve_seed_keeps_explicit_seed() -> None:
+    assert _resolve_seed(1234) == 1234
 
 
 def test_build_callbacks_includes_learning_rate_monitor() -> None:
@@ -56,3 +67,102 @@ def test_configure_optimizers_adds_linear_decay_scheduler() -> None:
     assert lambda_fn(4) == 0.5
     assert lambda_fn(5) == 0.25
     assert lambda_fn(6) == 0.0
+
+
+def test_on_validation_epoch_end_logs_macro_and_per_class_map(monkeypatch) -> None:
+    model = SoundEventLightningModule(
+        class_to_index={"class_a": 0, "class_b": 1},
+        learning_rate=1e-3,
+    )
+    model.validation_predictions = [
+        {
+            "filename": "sample.wav",
+            "annotations": pd.DataFrame(
+                [
+                    {
+                        "filename": "sample.wav",
+                        "annotation": "class_a",
+                        "onset": 0.0,
+                        "offset": 0.5,
+                    }
+                ]
+            ),
+        }
+    ]
+
+    logged_metrics: list[tuple[str, float, dict[str, object]]] = []
+
+    def fake_prediction_segments_to_frame(_prediction):
+        index = pd.MultiIndex.from_tuples(
+            [("sample.wav", 0.0)],
+            names=["filename", "segment_start"],
+        )
+        return pd.DataFrame({"class_a": [1], "class_b": [0]}, index=index)
+
+    def fake_calculate_map_score(_ground_truth_segments, _prediction_segments):
+        return 0.7, pd.DataFrame(
+            [
+                {"annotation": "class_a", "precision": 1.0, "recall": 1.0, "f1": 1.0, "map": 0.8},
+                {"annotation": "class_b", "precision": 0.0, "recall": 0.0, "f1": 0.0, "map": 0.6},
+            ]
+        )
+
+    def fake_log(name: str, value: float, **kwargs) -> None:
+        logged_metrics.append((name, value, kwargs))
+
+    monkeypatch.setattr(model, "_prediction_segments_to_frame", fake_prediction_segments_to_frame)
+    monkeypatch.setattr("domestic_sed.training.calculate_map_score", fake_calculate_map_score)
+    monkeypatch.setattr(model, "log", fake_log)
+
+    model.on_validation_epoch_end()
+
+    assert logged_metrics == [
+        ("val/map", 0.7, {"prog_bar": True, "on_step": False, "on_epoch": True, "sync_dist": False}),
+        ("val_class/map_class_a", 0.8, {"prog_bar": False, "on_step": False, "on_epoch": True, "sync_dist": False}),
+        ("val_class/map_class_b", 0.6, {"prog_bar": False, "on_step": False, "on_epoch": True, "sync_dist": False}),
+    ]
+
+
+def test_prediction_segments_to_frame_accepts_custom_segment_duration() -> None:
+    model = SoundEventLightningModule(
+        class_to_index={"class_a": 0, "class_b": 1},
+        learning_rate=1e-3,
+        sample_rate=4,
+    )
+    prediction = {
+        "filename": "sample.wav",
+        "audio_num_samples": 8,
+        "valid_output_frames": 4,
+        "probabilities": torch.tensor(
+            [
+                [0.1, 0.2],
+                [0.8, 0.4],
+                [0.3, 0.9],
+                [0.7, 0.5],
+            ]
+        ),
+    }
+
+    segment_frame = model._prediction_segments_to_frame(
+        prediction,
+        segment_duration_seconds=0.5,
+    )
+
+    expected_index = pd.MultiIndex.from_tuples(
+        [
+            ("sample.wav", 0.0),
+            ("sample.wav", 0.5),
+            ("sample.wav", 1.0),
+            ("sample.wav", 1.5),
+        ],
+        names=["filename", "segment_start"],
+    )
+    expected = pd.DataFrame(
+        {
+            "class_a": [0.1, 0.8, 0.3, 0.7],
+            "class_b": [0.2, 0.4, 0.9, 0.5],
+        },
+        index=expected_index,
+    )
+
+    pd.testing.assert_frame_equal(segment_frame, expected)

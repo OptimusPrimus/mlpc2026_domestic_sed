@@ -1,0 +1,31 @@
+program: src/domestic_sed/training.py
+project: domestic_sed
+method: bayes
+metric:
+  name: val/map
+  goal: maximize
+parameters:
+  architecture-depth:
+    value: 8
+  max-epochs:
+    values: [50, 75, 100]
+  learning-rate:
+    distribution: log_uniform_values
+    min: !!float 1e-4
+    max: !!float 1e-2
+  lr-linear-decay-epochs:
+    distribution: int_uniform
+    min: 0
+    max: 30
+  early-stopping-patience:
+    value: 10
+  architecture-base-multiplier:
+    value: 1
+command:
+  - ${env}
+  - python
+  - -m
+  - domestic_sed.training
+  - --wandb-save-dir=/opt/scratch/paul/mlpc2025_dl_tutorial/wandb
+  - --data-root=/opt/scratch/paul/data/real_desed
+  - ${args}

@@ -19,6 +19,8 @@ parameters:
     max: 30
   early-stopping-patience:
     value: 10
+  architecture-base-multiplier:
+    value: 2
 command:
   - ${env}
   - python
