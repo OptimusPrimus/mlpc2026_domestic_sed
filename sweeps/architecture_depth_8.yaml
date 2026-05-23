@@ -1,5 +1,5 @@
 program: src/domestic_sed/training.py
-name: mlpc2025_dl_tutorial
+project: mlpc2025_dl_tutorial
 method: bayes
 metric:
   name: val/map
