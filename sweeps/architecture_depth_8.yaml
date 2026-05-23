@@ -1,5 +1,5 @@
 program: src/domestic_sed/training.py
-name: architecture-depth-8-max-epochs-lr
+name: mlpc2025_dl_tutorial
 method: bayes
 metric:
   name: val/map
@@ -19,13 +19,11 @@ parameters:
     max: 30
   early-stopping-patience:
     value: 10
-  wandb-save-dir:
-    value: /opt/scratch/paul/mlpc2025_dl_tutorial/wandb
-  data-root:
-    value: /opt/scratch/paul/data/real_desed
 command:
   - ${env}
   - python
-  - -c
-  - "import sys; sys.path.insert(0, 'src'); from domestic_sed.training import main; main()"
-  - ${args_no_boolean_flags}
+  - -m
+  - domestic_sed.training
+  - --wandb-save-dir=/opt/scratch/paul/mlpc2025_dl_tutorial/wandb
+  - --data-root=/opt/scratch/paul/data/real_desed
+  - ${args}
