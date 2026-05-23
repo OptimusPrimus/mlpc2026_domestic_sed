@@ -19,6 +19,10 @@ parameters:
     max: 30
   early-stopping-patience:
     value: 10
+  wandb-save-dir:
+    value: /opt/scratch/paul/mlpc2025_dl_tutorial/wandb
+  data-root:
+    value: /opt/scratch/paul/data/real_desed
 command:
   - ${env}
   - python
