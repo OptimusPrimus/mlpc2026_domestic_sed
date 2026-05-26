@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import pandas as pd
 import torch
 from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor
@@ -9,6 +11,12 @@ def test_build_arg_parser_accepts_lr_linear_decay_epochs() -> None:
     args = build_arg_parser().parse_args(["--lr-linear-decay-epochs", "5"])
 
     assert args.lr_linear_decay_epochs == 5
+
+
+def test_build_arg_parser_defaults_lr_warmup_epochs_to_one() -> None:
+    args = build_arg_parser().parse_args([])
+
+    assert args.lr_warmup_epochs == 1
 
 
 def test_build_arg_parser_accepts_early_stopping_patience() -> None:
@@ -43,30 +51,35 @@ def test_build_callbacks_adds_early_stopping_when_configured() -> None:
     assert callbacks[1].patience == 10
 
 
-def test_configure_optimizers_adds_linear_decay_scheduler() -> None:
+def test_configure_optimizers_adds_stepwise_warmup_and_decay_scheduler() -> None:
     model = SoundEventLightningModule(
         class_to_index={f"class_{index}": index for index in range(15)},
         learning_rate=1e-3,
         weight_decay=0.0,
+        lr_warmup_epochs=1,
         lr_linear_decay_epochs=4,
         max_epochs=6,
     )
+    model._trainer = SimpleNamespace(estimated_stepping_batches=60)
 
     configured = model.configure_optimizers()
 
     assert isinstance(configured, dict)
-    scheduler = configured["lr_scheduler"]["scheduler"]
+    scheduler_config = configured["lr_scheduler"]
+    scheduler = scheduler_config["scheduler"]
     optimizer = configured["optimizer"]
     lambda_fn = scheduler.lr_lambdas[0]
 
     assert isinstance(optimizer, torch.optim.AdamW)
-    assert lambda_fn(0) == 1.0
-    assert lambda_fn(1) == 1.0
-    assert lambda_fn(2) == 1.0
-    assert lambda_fn(3) == 0.75
-    assert lambda_fn(4) == 0.5
-    assert lambda_fn(5) == 0.25
-    assert lambda_fn(6) == 0.0
+    assert scheduler_config["interval"] == "step"
+    assert lambda_fn(0) == 0.0
+    assert lambda_fn(5) == 0.5
+    assert lambda_fn(10) == 1.0
+    assert lambda_fn(20) == 1.0
+    assert lambda_fn(30) == 0.75
+    assert lambda_fn(40) == 0.5
+    assert lambda_fn(50) == 0.25
+    assert lambda_fn(60) == 0.0
 
 
 def test_on_validation_epoch_end_logs_macro_and_per_class_map(monkeypatch) -> None:

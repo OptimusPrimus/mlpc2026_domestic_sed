@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import secrets
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 os.environ["OMP_NUM_THREADS"] = "1"
 
@@ -195,6 +196,7 @@ class SoundEventLightningModule(L.LightningModule):
         class_to_index: dict[str, int],
         learning_rate: float,
         weight_decay: float = 0.0,
+        lr_warmup_epochs: int = 1,
         lr_linear_decay_epochs: int = 0,
         max_epochs: int = 30,
         sample_rate: int = DEFAULT_SAMPLE_RATE,
@@ -217,6 +219,7 @@ class SoundEventLightningModule(L.LightningModule):
         self.num_classes = len(class_to_index)
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
+        self.lr_warmup_epochs = lr_warmup_epochs
         self.lr_linear_decay_epochs = lr_linear_decay_epochs
         self.max_epochs = max_epochs
         self.hop_length = hop_length
@@ -383,15 +386,28 @@ class SoundEventLightningModule(L.LightningModule):
                 sync_dist=False,
             )
 
-    def _lr_decay_factor(self, epoch: int) -> float:
+    def _lr_warmup_factor(self, step: int, total_steps: int) -> float:
+        if self.lr_warmup_epochs <= 0:
+            return 1.0
+        warmup_steps = max(1, math.ceil(total_steps * self.lr_warmup_epochs / self.max_epochs))
+        return min(1.0, max(0.0, step / warmup_steps))
+
+    def _lr_decay_factor(self, step: int, total_steps: int) -> float:
         if self.lr_linear_decay_epochs <= 0:
             return 1.0
         decay_epochs = min(self.lr_linear_decay_epochs, self.max_epochs)
-        decay_start_epoch = self.max_epochs - decay_epochs
-        if epoch < decay_start_epoch:
+        decay_steps = max(1, math.ceil(total_steps * decay_epochs / self.max_epochs))
+        decay_start_step = total_steps - decay_steps
+        if step < decay_start_step:
             return 1.0
-        remaining_epochs = self.max_epochs - epoch
-        return max(0.0, remaining_epochs / decay_epochs)
+        remaining_steps = total_steps - step
+        return max(0.0, remaining_steps / decay_steps)
+
+    def _build_lr_factor(self, total_steps: int) -> Callable[[int], float]:
+        def lr_factor(step: int) -> float:
+            return self._lr_warmup_factor(step, total_steps) * self._lr_decay_factor(step, total_steps)
+
+        return lr_factor
 
     def configure_optimizers(self) -> dict[str, Any] | torch.optim.Optimizer:
         optimizer = torch.optim.AdamW(
@@ -399,17 +415,23 @@ class SoundEventLightningModule(L.LightningModule):
             lr=self.learning_rate,
             weight_decay=self.weight_decay,
         )
-        if self.lr_linear_decay_epochs <= 0:
+        if self.lr_warmup_epochs <= 0 and self.lr_linear_decay_epochs <= 0:
             return optimizer
+        if self.max_epochs <= 0:
+            raise ValueError("max_epochs must be positive when using a learning rate scheduler.")
+        trainer = getattr(self, "_trainer", None)
+        total_steps = getattr(trainer, "estimated_stepping_batches", 0) if trainer is not None else 0
+        if total_steps <= 0:
+            raise RuntimeError("estimated_stepping_batches must be available to configure the learning rate scheduler.")
         scheduler = torch.optim.lr_scheduler.LambdaLR(
             optimizer,
-            lr_lambda=self._lr_decay_factor,
+            lr_lambda=self._build_lr_factor(total_steps),
         )
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
-                "interval": "epoch",
+                "interval": "step",
                 "frequency": 1,
             },
         }
@@ -605,6 +627,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument(
+        "--lr-warmup-epochs",
+        type=int,
+        default=1,
+        help="Linearly warm the learning rate from zero to the base rate over the first N epochs.",
+    )
+    parser.add_argument(
         "--lr-linear-decay-epochs",
         type=int,
         default=0,
@@ -735,6 +763,7 @@ def main() -> None:
         class_to_index=datamodule.class_to_index,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
+        lr_warmup_epochs=args.lr_warmup_epochs,
         lr_linear_decay_epochs=args.lr_linear_decay_epochs,
         max_epochs=args.max_epochs,
         sample_rate=args.sample_rate,
