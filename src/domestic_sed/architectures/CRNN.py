@@ -483,11 +483,6 @@ class CRNN(nn.Module):
                         hidden_size = parameter.shape[0] // 4
                         parameter.data[hidden_size : 2 * hidden_size].fill_(1.0)
 
-        for module in self.modules():
-            if isinstance(module, _PreNormResidualBlock):
-                last_norm = module.pre_norm2[0]
-                if isinstance(last_norm, nn.BatchNorm2d):
-                    nn.init.zeros_(last_norm.weight)
 
     @staticmethod
     def _resolve_conv_padding(

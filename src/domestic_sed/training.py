@@ -727,6 +727,7 @@ def main() -> None:
         save_dir=str(args.wandb_save_dir),
         log_model=False,
     )
+    logger.log_hyperparams({"initial_seed": args.seed})
 
     trainer = L.Trainer(
         accelerator=args.accelerator,
