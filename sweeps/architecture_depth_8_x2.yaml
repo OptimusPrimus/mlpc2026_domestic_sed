@@ -8,17 +8,15 @@ parameters:
   architecture-depth:
     value: 8
   max-epochs:
-    values: [50, 75, 100, 125]
+    value: 100
   learning-rate:
     distribution: log_uniform_values
-    min: !!float 1e-4
-    max: !!float 1e-2
+    min: !!float 5e-3
+    max: !!float 5e-2
   lr-linear-decay-epochs:
     distribution: int_uniform
-    min: 0
-    max: 30
-  early-stopping-patience:
-    value: 10
+    min: 50
+    max: 99
   architecture-base-multiplier:
     value: 2
 command:
