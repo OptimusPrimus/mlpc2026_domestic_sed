@@ -6,6 +6,7 @@ from typing import Sequence
 
 import torch
 from torch import nn
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
 
 def _to_pair(value: int | tuple[int, int]) -> tuple[int, int]:
@@ -276,7 +277,7 @@ class CRNN(nn.Module):
 
         self.reset_parameters()
 
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+    def forward(self, inputs: torch.Tensor, input_lengths: torch.Tensor | None = None) -> torch.Tensor:
         if inputs.ndim == 3:
             inputs = inputs.unsqueeze(1)
         elif inputs.ndim != 4:
@@ -292,8 +293,36 @@ class CRNN(nn.Module):
         features = self.convolutional_stack(features)
         batch_size, channels, freq_bins, frames = features.shape
         features = features.permute(0, 3, 1, 2).contiguous().view(batch_size, frames, channels * freq_bins)
-        features, _ = self.lstm(features)
-        return self.classifier(features)
+        if input_lengths is None:
+            features, _ = self.lstm(features)
+            return self.classifier(features)
+
+        output_lengths = self.output_lengths(input_lengths=input_lengths).to(device="cpu", dtype=torch.long)
+        if output_lengths.ndim != 1:
+            raise ValueError(f"Expected input_lengths to have shape (batch,), got {tuple(input_lengths.shape)}")
+        if output_lengths.shape[0] != batch_size:
+            raise ValueError(
+                f"Expected {batch_size} sequence lengths, got {output_lengths.shape[0]}"
+            )
+        if torch.any(output_lengths <= 0):
+            raise ValueError("All input lengths must produce at least one output frame")
+
+        packed_features = pack_padded_sequence(
+            features,
+            lengths=output_lengths,
+            batch_first=True,
+            enforce_sorted=False,
+        )
+        packed_features, _ = self.lstm(packed_features)
+        features, _ = pad_packed_sequence(
+            packed_features,
+            batch_first=True,
+            total_length=frames,
+        )
+        logits = self.classifier(features)
+        padding_mask = torch.arange(frames, device=logits.device).unsqueeze(0) >= output_lengths.to(logits.device).unsqueeze(1)
+        logits = logits.masked_fill(padding_mask.unsqueeze(-1), 0.0)
+        return logits
 
     def conv_output_shape(self, input_frames: int) -> tuple[int, int, int]:
         summary = self.summarize(input_frames=input_frames)
@@ -306,6 +335,58 @@ class CRNN(nn.Module):
         summary = self.summarize(input_frames=input_frames)
         frames, classes, _ = summary[-1].output_shape
         return (frames, classes)
+
+    def output_lengths(self, input_lengths: torch.Tensor) -> torch.Tensor:
+        if input_lengths.ndim != 1:
+            raise ValueError(f"Expected input_lengths to have shape (batch,), got {tuple(input_lengths.shape)}")
+
+        lengths = input_lengths.to(dtype=torch.long)
+        lengths = self._conv_lengths(
+            lengths,
+            self.initial_conv_kernel_size[1],
+            self.initial_conv_stride[1],
+            self.initial_conv_padding[1],
+            self.initial_conv_dilation[1],
+        )
+
+        for block in self.conv_blocks_config:
+            conv1_kernel = _to_pair(block.conv1_kernel_size)
+            conv1_stride = _to_pair(block.conv1_stride)
+            conv1_dilation = _to_pair(block.conv1_dilation)
+            conv1_padding = self._resolve_conv_padding(block.conv1_padding, conv1_kernel, conv1_dilation)
+
+            conv2_kernel = _to_pair(block.conv2_kernel_size)
+            conv2_stride = _to_pair(block.conv2_stride)
+            conv2_dilation = _to_pair(block.conv2_dilation)
+            conv2_padding = self._resolve_conv_padding(block.conv2_padding, conv2_kernel, conv2_dilation)
+
+            lengths = self._conv_lengths(
+                lengths,
+                conv1_kernel[1],
+                conv1_stride[1],
+                conv1_padding[1],
+                conv1_dilation[1],
+            )
+            lengths = self._conv_lengths(
+                lengths,
+                conv2_kernel[1],
+                conv2_stride[1],
+                conv2_padding[1],
+                conv2_dilation[1],
+            )
+
+            if block.pool_kernel_size is not None:
+                pool_kernel = _to_pair(block.pool_kernel_size)
+                pool_stride = _to_pair(block.pool_stride or block.pool_kernel_size)
+                pool_padding = _to_pair(block.pool_padding)
+                lengths = self._pool_lengths(
+                    lengths,
+                    pool_kernel[1],
+                    pool_stride[1],
+                    pool_padding[1],
+                )
+
+        return lengths.clamp_min(1)
 
     def summarize(self, input_frames: int) -> list[CRNNSummaryEntry]:
         if input_frames <= 0:
@@ -503,6 +584,33 @@ class CRNN(nn.Module):
     @staticmethod
     def _pool_dim(size: int, kernel: int, stride: int, padding: int) -> int:
         return floor((size + (2 * padding) - kernel) / stride + 1)
+
+    @staticmethod
+    def _conv_lengths(
+        lengths: torch.Tensor,
+        kernel: int,
+        stride: int,
+        padding: int,
+        dilation: int,
+    ) -> torch.Tensor:
+        return torch.div(
+            lengths + (2 * padding) - dilation * (kernel - 1) - 1,
+            stride,
+            rounding_mode="floor",
+        ) + 1
+
+    @staticmethod
+    def _pool_lengths(
+        lengths: torch.Tensor,
+        kernel: int,
+        stride: int,
+        padding: int,
+    ) -> torch.Tensor:
+        return torch.div(
+            lengths + (2 * padding) - kernel,
+            stride,
+            rounding_mode="floor",
+        ) + 1
 
     def _reduced_frequency_bins(self) -> int:
         freq = self._conv_dim(

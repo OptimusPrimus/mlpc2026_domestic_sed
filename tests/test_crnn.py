@@ -49,6 +49,43 @@ def test_crnn_forward_and_summary() -> None:
     assert model.conv_output_shape(input_frames=200) == summary[-4].output_shape
 
 
+def test_crnn_lstm_respects_input_lengths() -> None:
+    model = CRNN(
+        conv_blocks=[
+            CRNNBlockConfig(
+                out_channels=16,
+                conv1_kernel_size=(3, 3),
+                conv2_kernel_size=(1, 1),
+                pool_kernel_size=(2, 2),
+                pool_stride=(2, 2),
+            ),
+        ],
+        lstm_hidden_size=32,
+        lstm_num_layers=1,
+        lstm_dropout=0.0,
+        use_batch_norm=False,
+        dropout=0.0,
+    ).eval()
+
+    short_frames = 120
+    padded_frames = 200
+    short_input = torch.randn(1, 128, short_frames)
+    padded_input = torch.zeros(2, 128, padded_frames)
+    padded_input[0, :, :short_frames] = short_input[0]
+    padded_input[1] = torch.randn(128, padded_frames)
+    input_lengths = torch.tensor([short_frames, padded_frames], dtype=torch.long)
+
+    standalone_output = model(short_input)
+    padded_output = model(padded_input, input_lengths=input_lengths)
+    valid_frames = model.output_shape(input_frames=short_frames)[0]
+
+    torch.testing.assert_close(
+        padded_output[0, :valid_frames],
+        standalone_output[0],
+    )
+    assert torch.count_nonzero(padded_output[0, valid_frames:]) == 0
+
+
 def test_build_default_crnn_blocks() -> None:
     blocks = build_default_crnn_blocks(p1=1, p2=1)
 

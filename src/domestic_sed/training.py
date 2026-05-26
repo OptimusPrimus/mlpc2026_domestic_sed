@@ -258,8 +258,16 @@ class SoundEventLightningModule(L.LightningModule):
             output_size=self.num_classes,
         )
 
-    def forward(self, waveform: torch.Tensor) -> torch.Tensor:
-        return self.model(self._waveform_to_features(waveform))
+    def forward(
+        self,
+        waveform: torch.Tensor,
+        audio_num_samples: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        spectrogram = self._waveform_to_features(waveform)
+        spectrogram_lengths = None
+        if audio_num_samples is not None:
+            spectrogram_lengths = self._num_spectrogram_frames_tensor(audio_num_samples, device=spectrogram.device)
+        return self.model(spectrogram, input_lengths=spectrogram_lengths)
 
     def training_step(self, batch: dict[str, Any], batch_idx: int) -> torch.Tensor:
         del batch_idx
@@ -279,7 +287,11 @@ class SoundEventLightningModule(L.LightningModule):
             dtype=spectrogram.dtype,
         )
         spectrogram, targets = self._apply_training_augmentations(spectrogram, targets)
-        logits = self.model(spectrogram)
+        spectrogram_lengths = self._num_spectrogram_frames_tensor(
+            batch["audio_num_samples"],
+            device=spectrogram.device,
+        )
+        logits = self.model(spectrogram, input_lengths=spectrogram_lengths)
         loss = self._compute_loss_from_targets(
             logits=logits,
             targets=targets,
@@ -291,7 +303,11 @@ class SoundEventLightningModule(L.LightningModule):
     def validation_step(self, batch: dict[str, Any], batch_idx: int) -> torch.Tensor:
         del batch_idx
         spectrogram = self._waveform_to_features(batch["waveform"])
-        logits = self.model(spectrogram)
+        spectrogram_lengths = self._num_spectrogram_frames_tensor(
+            batch["audio_num_samples"],
+            device=spectrogram.device,
+        )
+        logits = self.model(spectrogram, input_lengths=spectrogram_lengths)
         targets = self._build_targets(
             annotations_batch=batch["annotations"],
             audio_num_samples=batch["audio_num_samples"],
@@ -531,6 +547,18 @@ class SoundEventLightningModule(L.LightningModule):
 
     def _num_spectrogram_frames(self, num_samples: int) -> int:
         return 1 + max(0, num_samples // self.hparams.hop_length)
+
+    def _num_spectrogram_frames_tensor(
+        self,
+        num_samples: torch.Tensor,
+        *,
+        device: torch.device,
+    ) -> torch.Tensor:
+        return 1 + torch.div(
+            num_samples.to(device=device, dtype=torch.long),
+            self.hparams.hop_length,
+            rounding_mode="floor",
+        )
 
     def _prediction_segments_to_frame(
         self,
