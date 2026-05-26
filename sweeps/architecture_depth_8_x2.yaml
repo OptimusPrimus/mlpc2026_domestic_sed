@@ -12,7 +12,7 @@ parameters:
   learning-rate:
     distribution: log_uniform_values
     min: !!float 5e-3
-    max: !!float 5e-2
+    max: !!float 5e-5
   lr-linear-decay-epochs:
     distribution: int_uniform
     min: 50

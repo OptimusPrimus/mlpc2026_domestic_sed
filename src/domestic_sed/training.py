@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import os
 import secrets
 from pathlib import Path
 from typing import Any
+
+os.environ["OMP_NUM_THREADS"] = "1"
 
 import lightning as L
 import pandas as pd
