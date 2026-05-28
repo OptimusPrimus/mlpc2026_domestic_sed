@@ -10,7 +10,7 @@ BOX_FACE_COLOR = "white"
 BOX_EDGE_COLOR = "black"
 LINE_WIDTH = 1.5
 ARROW_STYLE = "-|>"
-FONT_SIZE = 16
+FONT_SIZE = 20
 
 
 def _draw_box(ax: plt.Axes, x: float, y: float, width: float, height: float, label: str) -> None:
@@ -36,34 +36,36 @@ def _draw_arrow(ax: plt.Axes, start: tuple[float, float], end: tuple[float, floa
 
 
 def main() -> None:
-    fig, ax = plt.subplots(figsize=(11, 4), constrained_layout=True)
-    ax.set_xlim(0.0, 1.0)
-    ax.set_ylim(0.0, 1.0)
+    fig, ax = plt.subplots(figsize=(4.7, 5.6))
+    fig.subplots_adjust(left=0.0, right=1.0, bottom=0.0, top=1.0)
+    ax.set_xlim(0.24, 0.86)
+    ax.set_ylim(-0.02, 0.97)
+    ax.set_aspect("equal", adjustable="box")
     ax.axis("off")
 
-    box_width = 0.10
-    box_height = 0.18
-    main_y = 0.58
-    left_margin = 0.14
-    gap = 0.035
-    box_xs = [left_margin + index * (box_width + gap) for index in range(6)]
-    labels = ["BN", "ReLU", "Conv", "BN", "ReLU", "Conv"]
+    box_width = 0.36
+    box_height = 0.06
+    main_x = 0.32
+    top_margin = 0.78
+    gap = 0.055
+    box_ys = [top_margin - index * (box_height + gap) for index in range(6)]
+    labels = ["BatchNorm", "ReLU", "Conv", "BatchNorm", "ReLU", "Conv"]
 
-    ax.text(0.05, main_y + box_height / 2.0, "x", ha="center", va="center", fontsize=FONT_SIZE)
-    ax.text(0.95, main_y + box_height / 2.0, "y", ha="center", va="center", fontsize=FONT_SIZE)
+    ax.text(main_x + box_width / 2.0, 0.93, "x", ha="center", va="center", fontsize=FONT_SIZE)
+    ax.text(0.50, 0.00, "y", ha="center", va="center", fontsize=FONT_SIZE)
 
-    for x, label in zip(box_xs, labels, strict=True):
-        _draw_box(ax, x, main_y, box_width, box_height, label)
+    for y, label in zip(box_ys, labels, strict=True):
+        _draw_box(ax, main_x, y, box_width, box_height, label)
 
-    _draw_arrow(ax, (0.065, main_y + box_height / 2.0), (box_xs[0], main_y + box_height / 2.0))
-    for left_x, right_x in zip(box_xs[:-1], box_xs[1:], strict=True):
+    _draw_arrow(ax, (main_x + box_width / 2.0, 0.905), (main_x + box_width / 2.0, box_ys[0] + box_height))
+    for upper_y, lower_y in zip(box_ys[:-1], box_ys[1:], strict=True):
         _draw_arrow(
             ax,
-            (left_x + box_width, main_y + box_height / 2.0),
-            (right_x, main_y + box_height / 2.0),
+            (main_x + box_width / 2.0, upper_y),
+            (main_x + box_width / 2.0, lower_y + box_height),
         )
 
-    sum_center = (0.88, main_y + box_height / 2.0)
+    sum_center = (0.50, 0.12)
     sum_radius = 0.035
     sum_circle = patches.Circle(sum_center, radius=sum_radius, linewidth=LINE_WIDTH, edgecolor="black", facecolor="white")
     ax.add_patch(sum_circle)
@@ -71,17 +73,18 @@ def main() -> None:
 
     _draw_arrow(
         ax,
-        (box_xs[-1] + box_width, main_y + box_height / 2.0),
-        (sum_center[0] - sum_radius, sum_center[1]),
+        (main_x + box_width / 2.0, box_ys[-1]),
+        (sum_center[0], sum_center[1] + sum_radius),
     )
-    _draw_arrow(ax, (sum_center[0] + sum_radius, sum_center[1]), (0.935, sum_center[1]))
+    _draw_arrow(ax, (sum_center[0], sum_center[1] - sum_radius), (0.50, 0.015))
 
-    skip_y = 0.24
-    ax.plot([0.05, 0.05], [main_y + box_height / 2.0, skip_y], color="black", linewidth=LINE_WIDTH)
-    ax.plot([0.05, sum_center[0]], [skip_y, skip_y], color="black", linewidth=LINE_WIDTH)
-    _draw_arrow(ax, (sum_center[0], skip_y), (sum_center[0], sum_center[1] - sum_radius))
+    skip_x = 0.82
+    x_center = main_x + box_width / 2.0
+    ax.plot([x_center + 0.05, skip_x], [0.93, 0.93], color="black", linewidth=LINE_WIDTH)
+    ax.plot([skip_x, skip_x], [0.93, sum_center[1]], color="black", linewidth=LINE_WIDTH)
+    _draw_arrow(ax, (skip_x, sum_center[1]), (sum_center[0] + sum_radius, sum_center[1]))
 
-    fig.savefig(OUTPUT_PDF, format="pdf", bbox_inches="tight")
+    fig.savefig(OUTPUT_PDF, format="pdf", bbox_inches="tight", pad_inches=0.02)
     plt.close(fig)
     print(f"Saved figure to {OUTPUT_PDF.resolve()}")
 
