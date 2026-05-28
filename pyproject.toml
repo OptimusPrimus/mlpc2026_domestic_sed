@@ -18,6 +18,8 @@ dependencies = [
   "scipy>=1.13",
   "scikit-learn>=1.5",
   "torchmetrics>=1.4",
+  "matplotlib>=3.9",
+  "librosa>=0.10",
 ]
 
 [project.scripts]
