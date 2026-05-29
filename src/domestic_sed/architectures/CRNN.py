@@ -253,10 +253,7 @@ class CRNN(nn.Module):
             bias=conv_bias and not use_batch_norm,
         )
 
-        self.initial_norm = nn.BatchNorm2d(input_channels) if use_batch_norm else nn.Identity()
-        self.initial_activation = nn.ReLU()
-
-
+        last_out = in_channels
         for block in self.conv_blocks_config:
             conv_layers.append(
                 _PreNormResidualBlock(
@@ -267,9 +264,13 @@ class CRNN(nn.Module):
                     dropout=dropout,
                 )
             )
+            last_out = block.out_channels
             in_channels = block.out_channels
 
         self.convolutional_stack = nn.Sequential(*conv_layers)
+
+        self.initial_norm = nn.BatchNorm2d(last_out) if use_batch_norm else nn.Identity()
+        self.initial_activation = nn.ReLU()
 
         conv_channels = self.conv_blocks_config[-1].out_channels
         conv_output_bins = self._reduced_frequency_bins()
