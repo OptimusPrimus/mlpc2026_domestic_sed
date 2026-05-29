@@ -204,8 +204,8 @@ class SoundEventLightningModule(L.LightningModule):
         n_fft: int = DEFAULT_N_FFT,
         hop_length: int = DEFAULT_HOP_LENGTH,
         win_length: int = DEFAULT_WIN_LENGTH,
-        lstm_hidden_size: int = 256,
-        lstm_num_layers: int = 2,
+        gru_hidden_size: int = 256,
+        gru_num_layers: int = 2,
         dropout: float = 0.2,
         architecture_p1: int = 5,
         architecture_p2: int = 5,
@@ -254,9 +254,9 @@ class SoundEventLightningModule(L.LightningModule):
                 channel_multiplier=architecture_base_multiplier,
             ),
             input_bins=n_mels,
-            lstm_hidden_size=lstm_hidden_size,
-            lstm_num_layers=lstm_num_layers,
-            lstm_dropout=dropout,
+            gru_hidden_size=gru_hidden_size,
+            gru_num_layers=gru_num_layers,
+            gru_dropout=dropout,
             dropout=dropout,
             output_size=self.num_classes,
         )
@@ -650,8 +650,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--n-fft", type=int, default=DEFAULT_N_FFT)
     parser.add_argument("--hop-length", type=int, default=DEFAULT_HOP_LENGTH)
     parser.add_argument("--win-length", type=int, default=DEFAULT_WIN_LENGTH)
-    parser.add_argument("--lstm-hidden-size", type=int, default=256)
-    parser.add_argument("--lstm-num-layers", type=int, default=2)
+    parser.add_argument("--gru-hidden-size", "--lstm-hidden-size", dest="gru_hidden_size", type=int, default=256)
+    parser.add_argument("--gru-num-layers", "--lstm-num-layers", dest="gru_num_layers", type=int, default=2)
     parser.add_argument("--dropout", type=float, default=0.2)
     parser.add_argument("--architecture-p1", type=int, default=5)
     parser.add_argument("--architecture-p2", type=int, default=5)
@@ -771,8 +771,8 @@ def main() -> None:
         n_fft=args.n_fft,
         hop_length=args.hop_length,
         win_length=args.win_length,
-        lstm_hidden_size=args.lstm_hidden_size,
-        lstm_num_layers=args.lstm_num_layers,
+        gru_hidden_size=args.gru_hidden_size,
+        gru_num_layers=args.gru_num_layers,
         dropout=args.dropout,
         architecture_p1=args.architecture_p1,
         architecture_p2=args.architecture_p2,

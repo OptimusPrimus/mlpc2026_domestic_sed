@@ -22,9 +22,9 @@ def test_crnn_forward_and_summary() -> None:
                 pool_kernel_size=None,
             ),
         ],
-        lstm_hidden_size=128,
-        lstm_num_layers=1,
-        lstm_dropout=0.1,
+        gru_hidden_size=128,
+        gru_num_layers=1,
+        gru_dropout=0.1,
         use_batch_norm=True,
         dropout=0.2,
     )
@@ -43,13 +43,13 @@ def test_crnn_forward_and_summary() -> None:
         "conv_block_1_pool",
     ]
     assert "conv_block_2_pool" not in {entry.name for entry in summary}
-    assert summary[-2].name == "lstm_output"
+    assert summary[-2].name == "gru_output"
     assert summary[-2].receptive_field == (128, 200)
     assert outputs.shape[1:] == model.output_shape(input_frames=200)
     assert model.conv_output_shape(input_frames=200) == summary[-4].output_shape
 
 
-def test_crnn_lstm_respects_input_lengths() -> None:
+def test_crnn_gru_respects_input_lengths() -> None:
     model = CRNN(
         conv_blocks=[
             CRNNBlockConfig(
@@ -60,9 +60,9 @@ def test_crnn_lstm_respects_input_lengths() -> None:
                 pool_stride=(2, 2),
             ),
         ],
-        lstm_hidden_size=32,
-        lstm_num_layers=1,
-        lstm_dropout=0.0,
+        gru_hidden_size=32,
+        gru_num_layers=1,
+        gru_dropout=0.0,
         use_batch_norm=False,
         dropout=0.0,
     ).eval()

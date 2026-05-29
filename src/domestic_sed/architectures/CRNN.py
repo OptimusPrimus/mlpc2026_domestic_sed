@@ -196,33 +196,44 @@ class CRNN(nn.Module):
         *,
         input_bins: int = 128,
         input_channels: int = 1,
-        lstm_hidden_size: int = 256,
-        lstm_num_layers: int = 2,
-        lstm_dropout: float = 0.0,
+        gru_hidden_size: int = 256,
+        gru_num_layers: int = 2,
+        gru_dropout: float = 0.0,
         bidirectional: bool = True,
         conv_bias: bool = True,
         use_batch_norm: bool = True,
         dropout: float = 0.0,
         output_size: int = 15,
+        lstm_hidden_size: int | None = None,
+        lstm_num_layers: int | None = None,
+        lstm_dropout: float | None = None,
     ) -> None:
         super().__init__()
+
+        if lstm_hidden_size is not None:
+            gru_hidden_size = lstm_hidden_size
+        if lstm_num_layers is not None:
+            gru_num_layers = lstm_num_layers
+        if lstm_dropout is not None:
+            gru_dropout = lstm_dropout
 
         if input_bins <= 0:
             raise ValueError("input_bins must be positive")
         if not conv_blocks:
             raise ValueError("conv_blocks must contain at least one block")
-        if lstm_num_layers <= 0:
-            raise ValueError("lstm_num_layers must be positive")
+        if gru_num_layers < 0:
+            raise ValueError("gru_num_layers must be positive")
         if not 0.0 <= dropout < 1.0:
             raise ValueError("dropout must be in [0, 1)")
-        if not 0.0 <= lstm_dropout < 1.0:
-            raise ValueError("lstm_dropout must be in [0, 1)")
+        if not 0.0 <= gru_dropout < 1.0:
+            raise ValueError("gru_dropout must be in [0, 1)")
 
         self.input_bins = input_bins
         self.input_channels = input_channels
         self.use_batch_norm = use_batch_norm
         self.output_size = output_size
-        self.lstm_hidden_size = lstm_hidden_size
+        self.gru_num_layers = gru_num_layers
+        self.gru_hidden_size = gru_hidden_size
         self.bidirectional = bidirectional
         self.initial_conv_kernel_size = (5, 5)
         self.initial_conv_stride = (2, 2)
@@ -231,18 +242,20 @@ class CRNN(nn.Module):
 
         self.conv_blocks_config = list(conv_blocks)
         conv_layers: list[nn.Module] = []
-        in_channels = input_channels
+        in_channels = 64
         self.initial_conv = nn.Conv2d(
-            in_channels=input_channels,
-            out_channels=input_channels,
+            in_channels=1,
+            out_channels=in_channels,
             kernel_size=self.initial_conv_kernel_size,
             stride=self.initial_conv_stride,
             padding=self.initial_conv_padding,
             dilation=self.initial_conv_dilation,
             bias=conv_bias and not use_batch_norm,
         )
+
         self.initial_norm = nn.BatchNorm2d(input_channels) if use_batch_norm else nn.Identity()
         self.initial_activation = nn.ReLU()
+
 
         for block in self.conv_blocks_config:
             conv_layers.append(
@@ -263,17 +276,21 @@ class CRNN(nn.Module):
         if conv_output_bins <= 0:
             raise ValueError("Convolutional stack collapses the frequency axis; adjust pooling or stride.")
 
-        lstm_input_size = conv_channels * conv_output_bins
-        self.lstm = nn.LSTM(
-            input_size=lstm_input_size,
-            hidden_size=lstm_hidden_size,
-            num_layers=lstm_num_layers,
-            dropout=lstm_dropout if lstm_num_layers > 1 else 0.0,
-            bidirectional=bidirectional,
-            batch_first=True,
-        )
-        classifier_input_size = lstm_hidden_size * (2 if bidirectional else 1)
-        self.classifier = nn.Linear(classifier_input_size, output_size)
+        gru_input_size = conv_channels * conv_output_bins
+
+        if gru_num_layers == 0:
+            self.classifier = nn.Linear(gru_input_size, output_size)
+        else:
+            self.gru = nn.GRU(
+                input_size=gru_input_size,
+                hidden_size=gru_hidden_size,
+                num_layers=gru_num_layers,
+                dropout=gru_dropout if gru_num_layers > 1 else 0.0,
+                bidirectional=bidirectional,
+                batch_first=True,
+            )
+            classifier_input_size = gru_hidden_size * (2 if bidirectional else 1)
+            self.classifier = nn.Linear(classifier_input_size, output_size)
 
         self.reset_parameters()
 
@@ -289,12 +306,14 @@ class CRNN(nn.Module):
         if inputs.shape[-2] != self.input_bins:
             raise ValueError(f"Expected {self.input_bins} mel bins, got {inputs.shape[-2]}")
 
-        features = self.initial_activation(self.initial_norm(self.initial_conv(inputs)))
+        features = self.initial_conv(inputs)
         features = self.convolutional_stack(features)
+        features = self.initial_activation(self.initial_norm(features))
         batch_size, channels, freq_bins, frames = features.shape
         features = features.permute(0, 3, 1, 2).contiguous().view(batch_size, frames, channels * freq_bins)
         if input_lengths is None:
-            features, _ = self.lstm(features)
+            assert False, "input_lengths must be provided"
+            features, _ = self.gru(features)
             return self.classifier(features)
 
         output_lengths = self.output_lengths(input_lengths=input_lengths).to(device="cpu", dtype=torch.long)
@@ -307,18 +326,19 @@ class CRNN(nn.Module):
         if torch.any(output_lengths <= 0):
             raise ValueError("All input lengths must produce at least one output frame")
 
-        packed_features = pack_padded_sequence(
-            features,
-            lengths=output_lengths,
-            batch_first=True,
-            enforce_sorted=False,
-        )
-        packed_features, _ = self.lstm(packed_features)
-        features, _ = pad_packed_sequence(
-            packed_features,
-            batch_first=True,
-            total_length=frames,
-        )
+        if self.gru_num_layers != 0:
+            packed_features = pack_padded_sequence(
+                features,
+                lengths=output_lengths,
+                batch_first=True,
+                enforce_sorted=False,
+            )
+            packed_features, _ = self.gru(packed_features)
+            features, _ = pad_packed_sequence(
+                packed_features,
+                batch_first=True,
+                total_length=frames,
+            )
         logits = self.classifier(features)
         padding_mask = torch.arange(frames, device=logits.device).unsqueeze(0) >= output_lengths.to(logits.device).unsqueeze(1)
         logits = logits.masked_fill(padding_mask.unsqueeze(-1), 0.0)
@@ -499,20 +519,20 @@ class CRNN(nn.Module):
         if freq <= 0 or time <= 0:
             raise ValueError("Configuration produces a non-positive tensor dimension")
 
-        lstm_feature_size = entries[-1].output_shape[0] * entries[-1].output_shape[1]
-        lstm_output_size = self.lstm_hidden_size * (2 if self.bidirectional else 1)
+        gru_feature_size = entries[-1].output_shape[0] * entries[-1].output_shape[1]
+        gru_output_size = self.gru_hidden_size * (2 if self.bidirectional else 1)
         entries.append(
             CRNNSummaryEntry(
-                name="lstm_input",
-                output_shape=(time, lstm_feature_size, 1),
+                name="gru_input",
+                output_shape=(time, gru_feature_size, 1),
                 receptive_field=(rf_freq, rf_time),
                 effective_stride=(jump_freq, jump_time),
             )
         )
         entries.append(
             CRNNSummaryEntry(
-                name="lstm_output",
-                output_shape=(time, lstm_output_size, 1),
+                name="gru_output",
+                output_shape=(time, gru_output_size, 1),
                 receptive_field=(self.input_bins, input_frames),
                 effective_stride=(jump_freq, jump_time),
             )
@@ -553,7 +573,7 @@ class CRNN(nn.Module):
             elif isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight)
                 nn.init.zeros_(module.bias)
-            elif isinstance(module, nn.LSTM):
+            elif isinstance(module, nn.GRU):
                 for name, parameter in module.named_parameters():
                     if "weight_ih" in name:
                         nn.init.xavier_uniform_(parameter)
@@ -561,8 +581,6 @@ class CRNN(nn.Module):
                         nn.init.orthogonal_(parameter)
                     elif "bias" in name:
                         nn.init.zeros_(parameter)
-                        hidden_size = parameter.shape[0] // 4
-                        parameter.data[hidden_size : 2 * hidden_size].fill_(1.0)
 
 
     @staticmethod
