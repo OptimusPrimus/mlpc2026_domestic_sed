@@ -18,6 +18,7 @@ from _spectrogram_convolution_common import (
 CONV_STRIDE = 1
 SHOW_AXIS_LABELS = False
 FIGURE_SIZE = (12, 3)
+DISTRIBUTION_FIGURE_SIZE = (4, 3)
 
 
 def normalize_feature_map(feature_map: np.ndarray) -> np.ndarray:
@@ -93,6 +94,24 @@ def save_feature_map_figure(
     plt.close(fig)
 
 
+def save_feature_map_distribution_figure(
+    feature_map: np.ndarray,
+    output_path: Path,
+    title: str,
+    color: str,
+) -> None:
+    fig, ax = plt.subplots(figsize=DISTRIBUTION_FIGURE_SIZE, constrained_layout=True)
+    flattened = feature_map.ravel()
+    ax.hist(flattened, bins=60, color=color, alpha=0.9, edgecolor="white", linewidth=0.4)
+    #ax.set_title(title, fontsize=13)
+    ax.set_xlabel("Feature value", fontsize=12)
+    ax.set_ylabel("Count", fontsize=12)
+    ax.grid(axis="y", alpha=0.25, linewidth=0.8)
+
+    save_figure(fig, output_path)
+    plt.close(fig)
+
+
 def save_figure(fig: plt.Figure, pdf_path: Path) -> None:
     fig.savefig(pdf_path, format="pdf")
     fig.savefig(pdf_path.with_suffix(".svg"), format="svg")
@@ -110,6 +129,8 @@ def main() -> None:
     unnormalized_pdf = output_dir / f"spectrogram_convolution_result_unnormalized{stride_suffix}.pdf"
     normalized_pdf = output_dir / f"spectrogram_convolution_result_normalized{stride_suffix}.pdf"
     relu_pdf = output_dir / f"spectrogram_convolution_result_normalized_relu{stride_suffix}.pdf"
+    distribution_before_pdf = output_dir / f"spectrogram_convolution_distribution_before_batch_norm{stride_suffix}.pdf"
+    distribution_after_pdf = output_dir / f"spectrogram_convolution_distribution_after_batch_norm{stride_suffix}.pdf"
 
     save_spectrogram_figure(logmel, duration_seconds, spectrogram_pdf)
     save_feature_map_figure(
@@ -139,6 +160,18 @@ def main() -> None:
         cmap="magma",
         symmetric_limits=False,
     )
+    save_feature_map_distribution_figure(
+        signed_convolution,
+        distribution_before_pdf,
+        title="Before BatchNorm",
+        color="#4C78A8",
+    )
+    save_feature_map_distribution_figure(
+        normalized_convolution,
+        distribution_after_pdf,
+        title="After BatchNorm",
+        color="#F58518",
+    )
 
     print(f"Saved figure to {spectrogram_pdf.resolve()}")
     print(f"Saved figure to {spectrogram_pdf.with_suffix('.svg').resolve()}")
@@ -148,6 +181,10 @@ def main() -> None:
     print(f"Saved figure to {normalized_pdf.with_suffix('.svg').resolve()}")
     print(f"Saved figure to {relu_pdf.resolve()}")
     print(f"Saved figure to {relu_pdf.with_suffix('.svg').resolve()}")
+    print(f"Saved figure to {distribution_before_pdf.resolve()}")
+    print(f"Saved figure to {distribution_before_pdf.with_suffix('.svg').resolve()}")
+    print(f"Saved figure to {distribution_after_pdf.resolve()}")
+    print(f"Saved figure to {distribution_after_pdf.with_suffix('.svg').resolve()}")
     print(f"Selected file: {sample['filename']}")
     print(f"Kernel transposed: {TRANSPOSE_KERNEL}")
     print(f"Convolution stride: {CONV_STRIDE}")

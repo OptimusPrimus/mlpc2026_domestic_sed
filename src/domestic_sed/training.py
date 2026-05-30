@@ -19,12 +19,9 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 from domestic_sed.augmentations import (
-    RandomResizeCrop,
     SpectrogramAugmentationConfig,
+    add_waveform_noise,
     filter_augmentation,
-    frame_shift,
-    mixstyle,
-    mixup,
     time_mask,
 )
 from domestic_sed.architectures import CRNN, CRNNBlockConfig, build_default_crnn_blocks
@@ -244,11 +241,6 @@ class SoundEventLightningModule(L.LightningModule):
             mel_scale="slaney",
         )
         self.amplitude_to_db = torchaudio.transforms.AmplitudeToDB(stype="power", top_db=80.0)
-        self.freq_warp = RandomResizeCrop(
-            virtual_crop_scale=self.augmentation_config.freq_warp_virtual_crop_scale,
-            freq_scale=self.augmentation_config.freq_warp_freq_scale,
-            time_scale=self.augmentation_config.freq_warp_time_scale,
-        )
         self.model = CRNN(
             conv_blocks=_default_crnn_blocks(
                 p1=architecture_p1,
@@ -277,7 +269,11 @@ class SoundEventLightningModule(L.LightningModule):
 
     def training_step(self, batch: dict[str, Any], batch_idx: int) -> torch.Tensor:
         del batch_idx
-        spectrogram = self._waveform_to_features(batch["waveform"])
+        waveform = self._apply_waveform_augmentations(
+            batch["waveform"],
+            audio_num_samples=batch["audio_num_samples"],
+        )
+        spectrogram = self._waveform_to_features(waveform)
         output_frames = self.model.output_shape(spectrogram.shape[-1])[0]
         targets = self._build_targets(
             annotations_batch=batch["annotations"],
@@ -292,10 +288,13 @@ class SoundEventLightningModule(L.LightningModule):
             device=spectrogram.device,
             dtype=spectrogram.dtype,
         )
-        spectrogram, targets = self._apply_training_augmentations(spectrogram, targets)
-        spectrogram_lengths = self._num_spectrogram_frames_tensor(
-            batch["audio_num_samples"],
-            device=spectrogram.device,
+        spectrogram_lengths = self._num_spectrogram_frames_tensor(batch["audio_num_samples"], device=spectrogram.device)
+        output_lengths = loss_mask[:, 0, :].sum(dim=1).to(dtype=torch.long)
+        spectrogram, targets = self._apply_training_augmentations(
+            spectrogram,
+            targets,
+            spectrogram_lengths=spectrogram_lengths,
+            output_lengths=output_lengths,
         )
         logits = self.model(spectrogram, input_lengths=spectrogram_lengths)
         loss = self._compute_loss_from_targets(
@@ -464,53 +463,52 @@ class SoundEventLightningModule(L.LightningModule):
         spectrogram = self.mel_transform(waveform)
         return self.amplitude_to_db(spectrogram)
 
+    def _apply_waveform_augmentations(
+        self,
+        waveform: torch.Tensor,
+        *,
+        audio_num_samples: torch.Tensor,
+    ) -> torch.Tensor:
+        config = self.augmentation_config
+        if config.waveform_noise_max_level <= 0.0:
+            return waveform
+        return add_waveform_noise(
+            waveform,
+            waveform_lengths=audio_num_samples,
+            max_noise_level=config.waveform_noise_max_level,
+        )
+
     def _apply_training_augmentations(
         self,
         spectrogram: torch.Tensor,
         targets: torch.Tensor,
+        *,
+        spectrogram_lengths: torch.Tensor,
+        output_lengths: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         config = self.augmentation_config
         augmented_spectrogram = spectrogram
         augmented_targets = targets
 
-        if config.frame_shift_range > 0.0:
-            augmented_spectrogram, augmented_targets = frame_shift(
-                augmented_spectrogram,
-                augmented_targets,
-                shift_range=config.frame_shift_range,
-            )
-
-        if config.mixup_p > 0.0 and torch.rand(1).item() < config.mixup_p:
-            augmented_spectrogram, augmented_targets = mixup(
-                augmented_spectrogram,
-                targets=augmented_targets,
-                alpha=config.mixup_alpha,
-                beta=config.mixup_beta,
-            )
-
-        if config.mixstyle_p > 0.0 and torch.rand(1).item() < config.mixstyle_p:
-            augmented_spectrogram = mixstyle(
-                augmented_spectrogram,
-                alpha=config.mixstyle_alpha,
-            )
-
-        if config.max_time_mask_size > 0.0:
+        if config.time_mask_regions_per_1000_frames > 0.0:
             augmented_spectrogram, augmented_targets = time_mask(
                 augmented_spectrogram,
                 augmented_targets,
-                max_mask_ratio=config.max_time_mask_size,
+                feature_lengths=spectrogram_lengths,
+                label_lengths=output_lengths,
+                regions_per_1000_frames=config.time_mask_regions_per_1000_frames,
+                min_mask_size=config.time_mask_min_size,
+                max_mask_size=config.time_mask_max_size,
             )
 
         if config.filter_augment_p > 0.0 and torch.rand(1).item() < config.filter_augment_p:
             augmented_spectrogram = filter_augmentation(
                 augmented_spectrogram,
-                filter_db_range=(config.filter_db_range_min, config.filter_db_range_max),
-                filter_bands=(config.filter_bands_min, config.filter_bands_max),
-                filter_minimum_bandwidth=config.filter_minimum_bandwidth,
+                filter_db_range=config.filter_db_range,
+                filter_n_band_min=config.filter_n_band_min,
+                filter_n_band_max=config.filter_n_band_max,
+                filter_min_bw=config.filter_min_bw,
             )
-
-        if config.freq_warp_p > 0.0 and torch.rand(1).item() < config.freq_warp_p:
-            augmented_spectrogram = self.freq_warp(augmented_spectrogram.squeeze(1)).unsqueeze(1)
 
         return augmented_spectrogram, augmented_targets
 
@@ -687,26 +685,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--architecture-p2", type=int, default=5)
     parser.add_argument("--architecture-depth", type=int, default=8)
     parser.add_argument("--architecture-base-multiplier", type=int, default=2)
-    parser.add_argument("--augmentation-frame-shift-range", type=float, default=0.0)
-    parser.add_argument("--augmentation-mixup-p", type=float, default=0.0)
-    parser.add_argument("--augmentation-mixup-alpha", type=float, default=0.2)
-    parser.add_argument("--augmentation-mixup-beta", type=float, default=0.2)
-    parser.add_argument("--augmentation-mixstyle-p", type=float, default=0.0)
-    parser.add_argument("--augmentation-mixstyle-alpha", type=float, default=0.4)
-    parser.add_argument("--augmentation-max-time-mask-size", type=float, default=0.0)
+    parser.add_argument("--augmentation-time-mask-regions-per-1000-frames", type=float, default=0.0)
+    parser.add_argument("--augmentation-time-mask-min-size", type=int, default=0)
+    parser.add_argument("--augmentation-time-mask-max-size", type=int, default=0)
     parser.add_argument("--augmentation-filter-p", type=float, default=0.0)
-    parser.add_argument("--augmentation-filter-db-min", type=float, default=-6.0)
-    parser.add_argument("--augmentation-filter-db-max", type=float, default=6.0)
-    parser.add_argument("--augmentation-filter-bands-min", type=int, default=3)
-    parser.add_argument("--augmentation-filter-bands-max", type=int, default=6)
-    parser.add_argument("--augmentation-filter-min-bandwidth", type=int, default=6)
-    parser.add_argument("--augmentation-freq-warp-p", type=float, default=0.0)
-    parser.add_argument("--augmentation-freq-warp-virtual-scale-freq", type=float, default=1.0)
-    parser.add_argument("--augmentation-freq-warp-virtual-scale-time", type=float, default=1.5)
-    parser.add_argument("--augmentation-freq-warp-freq-scale-min", type=float, default=1.0)
-    parser.add_argument("--augmentation-freq-warp-freq-scale-max", type=float, default=1.0)
-    parser.add_argument("--augmentation-freq-warp-time-scale-min", type=float, default=1.0)
-    parser.add_argument("--augmentation-freq-warp-time-scale-max", type=float, default=1.0)
+    parser.add_argument("--augmentation-filter-db-range", type=float, default=6.0)
+    parser.add_argument("--augmentation-filter-n-band-min", type=int, default=3)
+    parser.add_argument("--augmentation-filter-n-band-max", type=int, default=6)
+    parser.add_argument("--augmentation-filter-min-bw", type=int, default=6)
+    parser.add_argument("--augmentation-waveform-noise-max-level", type=float, default=0.0)
     parser.add_argument(
         "--class-names",
         type=str,
@@ -749,6 +736,24 @@ def main() -> None:
         raise ValueError("--min-learning-rate must be non-negative.")
     if args.min_learning_rate > args.learning_rate:
         raise ValueError("--min-learning-rate must be less than or equal to --learning-rate.")
+    if args.augmentation_time_mask_regions_per_1000_frames < 0.0:
+        raise ValueError("--augmentation-time-mask-regions-per-1000-frames must be non-negative.")
+    if args.augmentation_time_mask_min_size < 0:
+        raise ValueError("--augmentation-time-mask-min-size must be non-negative.")
+    if args.augmentation_time_mask_max_size < args.augmentation_time_mask_min_size:
+        raise ValueError("--augmentation-time-mask-max-size must be greater than or equal to --augmentation-time-mask-min-size.")
+    if args.augmentation_filter_p < 0.0 or args.augmentation_filter_p > 1.0:
+        raise ValueError("--augmentation-filter-p must be in [0, 1].")
+    if args.augmentation_filter_db_range < 0.0:
+        raise ValueError("--augmentation-filter-db-range must be non-negative.")
+    if args.augmentation_filter_n_band_min <= 0:
+        raise ValueError("--augmentation-filter-n-band-min must be positive.")
+    if args.augmentation_filter_n_band_max < args.augmentation_filter_n_band_min:
+        raise ValueError("--augmentation-filter-n-band-max must be greater than or equal to --augmentation-filter-n-band-min.")
+    if args.augmentation_filter_min_bw < 1:
+        raise ValueError("--augmentation-filter-min-bw must be at least 1.")
+    if args.augmentation_waveform_noise_max_level < 0.0:
+        raise ValueError("--augmentation-waveform-noise-max-level must be non-negative.")
     args.seed = _resolve_seed(args.seed)
     L.seed_everything(args.seed, workers=True)
 
@@ -757,32 +762,15 @@ def main() -> None:
         initial_class_names = [name.strip() for name in args.class_names.split(",") if name.strip()]
 
     augmentation_config = SpectrogramAugmentationConfig(
-        frame_shift_range=args.augmentation_frame_shift_range,
-        mixup_p=args.augmentation_mixup_p,
-        mixup_alpha=args.augmentation_mixup_alpha,
-        mixup_beta=args.augmentation_mixup_beta,
-        mixstyle_p=args.augmentation_mixstyle_p,
-        mixstyle_alpha=args.augmentation_mixstyle_alpha,
-        max_time_mask_size=args.augmentation_max_time_mask_size,
+        time_mask_regions_per_1000_frames=args.augmentation_time_mask_regions_per_1000_frames,
+        time_mask_min_size=args.augmentation_time_mask_min_size,
+        time_mask_max_size=args.augmentation_time_mask_max_size,
         filter_augment_p=args.augmentation_filter_p,
-        filter_db_range_min=args.augmentation_filter_db_min,
-        filter_db_range_max=args.augmentation_filter_db_max,
-        filter_bands_min=args.augmentation_filter_bands_min,
-        filter_bands_max=args.augmentation_filter_bands_max,
-        filter_minimum_bandwidth=args.augmentation_filter_min_bandwidth,
-        freq_warp_p=args.augmentation_freq_warp_p,
-        freq_warp_virtual_crop_scale=(
-            args.augmentation_freq_warp_virtual_scale_freq,
-            args.augmentation_freq_warp_virtual_scale_time,
-        ),
-        freq_warp_freq_scale=(
-            args.augmentation_freq_warp_freq_scale_min,
-            args.augmentation_freq_warp_freq_scale_max,
-        ),
-        freq_warp_time_scale=(
-            args.augmentation_freq_warp_time_scale_min,
-            args.augmentation_freq_warp_time_scale_max,
-        ),
+        filter_db_range=args.augmentation_filter_db_range,
+        filter_n_band_min=args.augmentation_filter_n_band_min,
+        filter_n_band_max=args.augmentation_filter_n_band_max,
+        filter_min_bw=args.augmentation_filter_min_bw,
+        waveform_noise_max_level=args.augmentation_waveform_noise_max_level,
     )
 
     datamodule = SoundEventDataModule(
