@@ -13,7 +13,7 @@ parameters:
   learning-rate:
     value: !!float 1e-4
   min-learning-rate:
-    distribution: uniform_values
+    distribution: uniform
     min: !!float 1e-7
     max: !!float 1e-4
   lr-linear-decay-start-epoch:
