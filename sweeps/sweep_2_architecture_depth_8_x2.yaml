@@ -1,6 +1,7 @@
 program: src/domestic_sed/training.py
 project: domestic_sed_scheduler
 method: bayes
+run_cap: 30
 metric:
   name: val/map
   goal: maximize
@@ -10,13 +11,11 @@ parameters:
   max-epochs:
     value: 50
   learning-rate:
-    distribution: log_uniform_values
-    min: !!float 5e-5
-    max: !!float 1e-4
+    value: !!float 1e-4
   min-learning-rate:
-    distribution: log_uniform_values
+    distribution: uniform_values
     min: !!float 1e-7
-    max: !!float 1e-5
+    max: !!float 1e-4
   lr-linear-decay-start-epoch:
     distribution: int_uniform
     min: 1
