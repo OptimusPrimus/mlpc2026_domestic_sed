@@ -31,6 +31,7 @@ from domestic_sed.architectures import CRNN, CRNNBlockConfig, build_default_crnn
 from domestic_sed.dataset import MLPC2026SoundEventDataset
 from domestic_sed.metrics.segment_based_metrics import (
     build_segment_frame_from_intervals,
+    calculate_f1_score,
     calculate_map_score,
 )
 
@@ -197,7 +198,8 @@ class SoundEventLightningModule(L.LightningModule):
         learning_rate: float,
         weight_decay: float = 0.0,
         lr_warmup_epochs: int = 1,
-        lr_linear_decay_epochs: int = 0,
+        lr_linear_decay_start_epoch: int | None = None,
+        min_learning_rate: float = 0.0,
         max_epochs: int = 30,
         sample_rate: int = DEFAULT_SAMPLE_RATE,
         n_mels: int = DEFAULT_MEL_BINS,
@@ -220,7 +222,8 @@ class SoundEventLightningModule(L.LightningModule):
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
         self.lr_warmup_epochs = lr_warmup_epochs
-        self.lr_linear_decay_epochs = lr_linear_decay_epochs
+        self.lr_linear_decay_start_epoch = lr_linear_decay_start_epoch
+        self.min_learning_rate = min_learning_rate
         self.max_epochs = max_epochs
         self.hop_length = hop_length
         self.augmentation_config = augmentation_config or SpectrogramAugmentationConfig()
@@ -374,12 +377,28 @@ class SoundEventLightningModule(L.LightningModule):
         else:
             prediction_segments = pd.DataFrame()
 
+        thresholded_prediction_segments = prediction_segments.where(prediction_segments < 0.5, 1.0)
+        thresholded_prediction_segments = thresholded_prediction_segments.where(
+            thresholded_prediction_segments >= 0.5,
+            0.0,
+        )
         macro_map, per_class_map = calculate_map_score(ground_truth_segments, prediction_segments)
+        macro_f1, per_class_f1 = calculate_f1_score(ground_truth_segments, thresholded_prediction_segments)
         self.log("val/map", macro_map, prog_bar=True, on_step=False, on_epoch=True, sync_dist=False)
+        self.log("val/f1", macro_f1, prog_bar=False, on_step=False, on_epoch=True, sync_dist=False)
         for row in per_class_map.itertuples(index=False):
             self.log(
                 f"val_class/map_{row.annotation}",
                 row.map,
+                prog_bar=False,
+                on_step=False,
+                on_epoch=True,
+                sync_dist=False,
+            )
+        for row in per_class_f1.itertuples(index=False):
+            self.log(
+                f"val_class/f1_{row.annotation}",
+                row.f1,
                 prog_bar=False,
                 on_step=False,
                 on_epoch=True,
@@ -393,15 +412,20 @@ class SoundEventLightningModule(L.LightningModule):
         return min(1.0, max(0.0, step / warmup_steps))
 
     def _lr_decay_factor(self, step: int, total_steps: int) -> float:
-        if self.lr_linear_decay_epochs <= 0:
+        if self.lr_linear_decay_start_epoch is None:
             return 1.0
-        decay_epochs = min(self.lr_linear_decay_epochs, self.max_epochs)
-        decay_steps = max(1, math.ceil(total_steps * decay_epochs / self.max_epochs))
-        decay_start_step = total_steps - decay_steps
+        decay_start_epoch = min(max(self.lr_linear_decay_start_epoch, 1), self.max_epochs)
+        decay_start_step = min(
+            total_steps,
+            math.ceil(total_steps * (decay_start_epoch - 1) / self.max_epochs),
+        )
         if step < decay_start_step:
             return 1.0
-        remaining_steps = total_steps - step
-        return max(0.0, remaining_steps / decay_steps)
+        decay_steps = max(1, total_steps - decay_start_step)
+        min_lr_factor = self.min_learning_rate / self.learning_rate if self.learning_rate > 0.0 else 0.0
+        min_lr_factor = min(max(min_lr_factor, 0.0), 1.0)
+        decay_progress = min(1.0, max(0.0, (step - decay_start_step) / decay_steps))
+        return 1.0 - decay_progress * (1.0 - min_lr_factor)
 
     def _build_lr_factor(self, total_steps: int) -> Callable[[int], float]:
         def lr_factor(step: int) -> float:
@@ -415,7 +439,7 @@ class SoundEventLightningModule(L.LightningModule):
             lr=self.learning_rate,
             weight_decay=self.weight_decay,
         )
-        if self.lr_warmup_epochs <= 0 and self.lr_linear_decay_epochs <= 0:
+        if self.lr_warmup_epochs <= 0 and self.lr_linear_decay_start_epoch is None:
             return optimizer
         if self.max_epochs <= 0:
             raise ValueError("max_epochs must be positive when using a learning rate scheduler.")
@@ -629,14 +653,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--lr-warmup-epochs",
         type=int,
-        default=1,
+        default=0,
         help="Linearly warm the learning rate from zero to the base rate over the first N epochs.",
     )
     parser.add_argument(
-        "--lr-linear-decay-epochs",
+        "--lr-linear-decay-start-epoch",
         type=int,
-        default=0,
-        help="Linearly decay the learning rate to zero over the last N epochs of training.",
+        default=None,
+        help="Start linearly decaying the learning rate at the beginning of epoch N (1-indexed).",
+    )
+    parser.add_argument(
+        "--min-learning-rate",
+        type=float,
+        default=0.0,
+        help="Minimum learning rate reached at the end of linear decay.",
     )
     parser.add_argument(
         "--early-stopping-patience",
@@ -713,6 +743,12 @@ def build_callbacks(*, early_stopping_patience: int | None) -> list[L.Callback]:
 
 def main() -> None:
     args = build_arg_parser().parse_args()
+    if args.lr_linear_decay_start_epoch is not None and args.lr_linear_decay_start_epoch < 1:
+        raise ValueError("--lr-linear-decay-start-epoch must be at least 1.")
+    if args.min_learning_rate < 0.0:
+        raise ValueError("--min-learning-rate must be non-negative.")
+    if args.min_learning_rate > args.learning_rate:
+        raise ValueError("--min-learning-rate must be less than or equal to --learning-rate.")
     args.seed = _resolve_seed(args.seed)
     L.seed_everything(args.seed, workers=True)
 
@@ -764,7 +800,8 @@ def main() -> None:
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
         lr_warmup_epochs=args.lr_warmup_epochs,
-        lr_linear_decay_epochs=args.lr_linear_decay_epochs,
+        lr_linear_decay_start_epoch=args.lr_linear_decay_start_epoch,
+        min_learning_rate=args.min_learning_rate,
         max_epochs=args.max_epochs,
         sample_rate=args.sample_rate,
         n_mels=args.n_mels,

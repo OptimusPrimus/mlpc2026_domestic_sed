@@ -129,6 +129,8 @@ def calculate_f1_score(
     combined_index = ground_truth_segments.index.union(prediction_segments.index)
     ground_truth_segments = ground_truth_segments.reindex(combined_index, fill_value=0)
     prediction_segments = prediction_segments.reindex(combined_index, fill_value=0)
+    _validate_binary_segment_frame(ground_truth_segments, frame_name="ground_truth_segments")
+    _validate_binary_segment_frame(prediction_segments, frame_name="prediction_segments")
 
     classes = sorted(
         set(ground_truth_segments.columns.tolist()).union(prediction_segments.columns.tolist())
@@ -153,6 +155,26 @@ def calculate_f1_score(
     macro_f1 = float(results["f1"].mean())
 
     return macro_f1, results
+
+
+def _validate_binary_segment_frame(frame: pd.DataFrame, *, frame_name: str) -> None:
+    """Ensure a segment frame contains only binary labels."""
+    if frame.empty:
+        return
+
+    invalid_columns: list[str] = []
+    for column in frame.columns:
+        values = frame[column].dropna()
+        if values.empty:
+            continue
+        if not values.isin([0, 1, False, True]).all():
+            invalid_columns.append(str(column))
+
+    if invalid_columns:
+        raise ValueError(
+            f"{frame_name} must contain only binary values (0 or 1). "
+            f"Got non-binary values in columns: {', '.join(sorted(invalid_columns))}"
+        )
 
 
 def calculate_map_score(

@@ -11,14 +11,10 @@ parameters:
     value: 100
   learning-rate:
     distribution: log_uniform_values
-    min: !!float 5e-3
-    max: !!float 5e-2
-  lr-linear-decay-epochs:
-    distribution: int_uniform
-    min: 50
-    max: 99
+    min: !!float 1e-5
+    max: !!float 5e-3
   architecture-base-multiplier:
-    value: 1
+    value: 2
 command:
   - ${env}
   - python

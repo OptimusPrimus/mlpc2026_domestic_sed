@@ -28,17 +28,17 @@ WIN_LENGTH = 2048
 TOP_DB = 80.0
 AXIS_LABEL_FONTSIZE = 15
 KERNEL_RADIUS = 2
-TRANSPOSE_KERNEL = False
+TRANSPOSE_KERNEL = True
 SIGNED_KERNEL = np.array(
     [
-        [0.0, 0.0, 0.0, 0.0, 0.0],
-        [0.0, 0.0, 0.0, 0.0, 0.0],
-        [-1.0, -1.0, 0.0, 1.0, 1.0],
-        [0.0, 0.0, 0.0, 0.0, 0.0],
-        [0.0, 0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.5, 1.0, 0.5, 0.0],
+        [0.5, 1.0, 2.0, 1.0, 0.5],
+        [1.0, 2.0, 3.0, 2.0, 1.0],
+        [0.5, 1.0, 2.0, 1.0, 0.5],
+        [0.0, 0.5, 1.0, 0.5, 0.0],
     ],
     dtype=np.float32,
-) / 2.0
+) / 3.0
 
 
 def select_sample(dataset: MLPC2026SoundEventDataset) -> dict[str, object]:
