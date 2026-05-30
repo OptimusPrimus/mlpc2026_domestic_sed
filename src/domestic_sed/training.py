@@ -647,7 +647,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--data-root", type=Path, help="Dataset root containing the train split.", default="/home/paul/data/mlpc2026_dataset/MLPC2026_challenge_dataset_raw/")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument("--max-epochs", type=int, default=30)
+    parser.add_argument("--max-epochs", type=int, default=100)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=0.0)
     parser.add_argument(
@@ -685,7 +685,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dropout", type=float, default=0.2)
     parser.add_argument("--architecture-p1", type=int, default=5)
     parser.add_argument("--architecture-p2", type=int, default=5)
-    parser.add_argument("--architecture-depth", type=int, default=12)
+    parser.add_argument("--architecture-depth", type=int, default=8)
     parser.add_argument("--architecture-base-multiplier", type=int, default=2)
     parser.add_argument("--augmentation-frame-shift-range", type=float, default=0.0)
     parser.add_argument("--augmentation-mixup-p", type=float, default=0.0)

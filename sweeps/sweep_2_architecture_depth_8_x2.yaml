@@ -1,5 +1,5 @@
 program: src/domestic_sed/training.py
-project: domestic_sed
+project: domestic_sed_scheduler
 method: bayes
 metric:
   name: val/map
@@ -11,8 +11,8 @@ parameters:
     value: 50
   learning-rate:
     distribution: log_uniform_values
-    min: !!float 1e-5
-    max: !!float 5e-3
+    min: !!float 5e-5
+    max: !!float 1e-4
   min-learning-rate:
     distribution: log_uniform_values
     min: !!float 1e-7
