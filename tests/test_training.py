@@ -4,7 +4,7 @@ import pandas as pd
 import torch
 from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor
 
-from domestic_sed.augmentations import SpectrogramAugmentationConfig
+from domestic_sed.augmentations import SpectrogramAugmentationConfig, filter_augmentation
 from domestic_sed.training import SoundEventLightningModule, _resolve_seed, build_arg_parser, build_callbacks
 
 
@@ -122,6 +122,50 @@ def test_waveform_noise_augmentation_is_disabled_by_default() -> None:
     )
 
     assert torch.equal(augmented, waveform)
+
+
+def test_filter_augmentation_accepts_three_dimensional_spectrograms() -> None:
+    spectrogram = torch.ones(2, 128, 64)
+
+    augmented = filter_augmentation(
+        spectrogram,
+        filter_db_range=3.0,
+        filter_n_band_min=2,
+        filter_n_band_max=4,
+        filter_min_bw=4,
+    )
+
+    assert augmented.shape == spectrogram.shape
+
+
+def test_training_filter_augmentation_is_applied_per_spectrogram(monkeypatch) -> None:
+    model = SoundEventLightningModule(
+        class_to_index={f"class_{index}": index for index in range(2)},
+        learning_rate=1e-3,
+        augmentation_config=SpectrogramAugmentationConfig(
+            filter_augment_p=0.5,
+            filter_db_range=3.0,
+            filter_n_band_min=2,
+            filter_n_band_max=4,
+            filter_min_bw=4,
+        ),
+    )
+    spectrogram = torch.zeros(3, 128, 16)
+    targets = torch.zeros(3, 2, 4)
+
+    monkeypatch.setattr("domestic_sed.training.torch.rand", lambda *args, **kwargs: torch.tensor([0.2, 0.7, 0.1]))
+
+    def fake_filter_augmentation(features: torch.Tensor, **_kwargs) -> torch.Tensor:
+        return features + 1.0
+
+    monkeypatch.setattr("domestic_sed.training.filter_augmentation", fake_filter_augmentation)
+
+    augmented_spectrogram, augmented_targets = model._apply_training_augmentations(spectrogram, targets)
+
+    assert torch.equal(augmented_targets, targets)
+    assert torch.all(augmented_spectrogram[0] == 1.0)
+    assert torch.all(augmented_spectrogram[1] == 0.0)
+    assert torch.all(augmented_spectrogram[2] == 1.0)
 
 
 def test_on_validation_epoch_end_logs_macro_and_per_class_map(monkeypatch) -> None:
