@@ -22,7 +22,7 @@ parameters:
     distribution: uniform
     min: !!float 0
     max: !!float 1
-  augmentation-filter-db-range":
+  augmentation-filter-db-range:
     distribution: uniform
     min: !!float 1
     max: !!float 6
