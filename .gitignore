@@ -11,3 +11,6 @@ artifacts/
 checkpoints/
 
 /.python-version
+/tests/
+/visualizations/
+/resources/
