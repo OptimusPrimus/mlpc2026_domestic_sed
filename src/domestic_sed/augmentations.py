@@ -81,11 +81,21 @@ def filter_augmentation(
     filter_n_band_max: int = 6,
     filter_min_bw: int = 6,
 ) -> torch.Tensor:
+    squeeze_channel = False
+    if features.ndim == 3:
+        features = features.unsqueeze(1)
+        squeeze_channel = True
+    elif features.ndim != 4:
+        raise ValueError(
+            "Expected features of shape (batch, mel_bins, frames) or "
+            "(batch, channels, mel_bins, frames)"
+        )
+
     batch_size, _, n_freq_bin, _ = features.shape
     if filter_db_range < 0.0:
-        return features
+        return features.squeeze(1) if squeeze_channel else features
     if filter_n_band_min <= 0 or filter_n_band_max < filter_n_band_min:
-        return features
+        return features.squeeze(1) if squeeze_channel else features
 
     n_band = int(
         torch.randint(
@@ -96,7 +106,7 @@ def filter_augmentation(
         ).item()
     )
     if n_band <= 1:
-        return features
+        return features.squeeze(1) if squeeze_channel else features
 
     band_boundaries = _sample_band_boundaries(
         n_freq_bin=n_freq_bin,
@@ -105,7 +115,7 @@ def filter_augmentation(
         device=features.device,
     )
     if band_boundaries is None:
-        return features
+        return features.squeeze(1) if squeeze_channel else features
 
     band_factors = (
         torch.rand((batch_size, n_band + 1), device=features.device, dtype=features.dtype)
@@ -127,4 +137,5 @@ def filter_augmentation(
                 dtype=features.dtype,
             ).unsqueeze(-1)
     freq_filt = 10 ** (freq_filt / 20)
-    return features * freq_filt.unsqueeze(1)
+    augmented = features * freq_filt.unsqueeze(1)
+    return augmented.squeeze(1) if squeeze_channel else augmented

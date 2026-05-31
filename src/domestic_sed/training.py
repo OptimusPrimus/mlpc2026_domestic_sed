@@ -480,14 +480,18 @@ class SoundEventLightningModule(L.LightningModule):
         augmented_spectrogram = spectrogram
         augmented_targets = targets
 
-        if config.filter_augment_p > 0.0 and torch.rand(1).item() < config.filter_augment_p:
-            augmented_spectrogram = filter_augmentation(
-                augmented_spectrogram,
-                filter_db_range=config.filter_db_range,
-                filter_n_band_min=config.filter_n_band_min,
-                filter_n_band_max=config.filter_n_band_max,
-                filter_min_bw=config.filter_min_bw,
+        if config.filter_augment_p > 0.0:
+            augment_mask = torch.rand(augmented_spectrogram.shape[0], device=augmented_spectrogram.device) < (
+                config.filter_augment_p
             )
+            for batch_index in torch.nonzero(augment_mask, as_tuple=False).flatten().tolist():
+                augmented_spectrogram[batch_index : batch_index + 1] = filter_augmentation(
+                    augmented_spectrogram[batch_index : batch_index + 1],
+                    filter_db_range=config.filter_db_range,
+                    filter_n_band_min=config.filter_n_band_min,
+                    filter_n_band_max=config.filter_n_band_max,
+                    filter_min_bw=config.filter_min_bw,
+                )
 
         return augmented_spectrogram, augmented_targets
 
