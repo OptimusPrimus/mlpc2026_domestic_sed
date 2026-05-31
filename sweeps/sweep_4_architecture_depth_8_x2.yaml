@@ -1,0 +1,36 @@
+program: src/domestic_sed/training.py
+project: domestic_sed_aug_filter
+method: bayes
+run_cap: 100
+metric:
+  name: val/map
+  goal: maximize
+parameters:
+  architecture-depth:
+    value: 8
+  max-epochs:
+    value: 100
+  learning-rate:
+    value: !!float 1e-4
+  min-learning-rate:
+    value: !!float 0
+  lr-linear-decay-start-epoch:
+    value: 1
+  architecture-base-multiplier:
+    value: 2
+  augmentation-filter-p:
+    distribution: uniform
+    min: !!float 0
+    max: !!float 1
+  augmentation-filter-db-range":
+    distribution: uniform
+    min: !!float 1
+    max: !!float 6
+command:
+  - ${env}
+  - python
+  - -m
+  - domestic_sed.training
+  - --wandb-save-dir=/opt/scratch/paul/mlpc2025_dl_tutorial/wandb
+  - --data-root=/opt/scratch/paul/data/real_desed
+  - ${args}

@@ -86,12 +86,6 @@ def test_configure_optimizers_adds_stepwise_warmup_and_decay_scheduler() -> None
 def test_build_arg_parser_accepts_new_augmentation_arguments() -> None:
     args = build_arg_parser().parse_args(
         [
-            "--augmentation-time-mask-regions-per-1000-frames",
-            "12.5",
-            "--augmentation-time-mask-min-size",
-            "4",
-            "--augmentation-time-mask-max-size",
-            "17",
             "--augmentation-filter-p",
             "0.4",
             "--augmentation-filter-db-range",
@@ -107,9 +101,6 @@ def test_build_arg_parser_accepts_new_augmentation_arguments() -> None:
         ]
     )
 
-    assert args.augmentation_time_mask_regions_per_1000_frames == 12.5
-    assert args.augmentation_time_mask_min_size == 4
-    assert args.augmentation_time_mask_max_size == 17
     assert args.augmentation_filter_p == 0.4
     assert args.augmentation_filter_db_range == 4.0
     assert args.augmentation_filter_n_band_min == 2
@@ -131,50 +122,6 @@ def test_waveform_noise_augmentation_is_disabled_by_default() -> None:
     )
 
     assert torch.equal(augmented, waveform)
-
-
-def test_time_mask_respects_per_sample_audio_lengths(monkeypatch) -> None:
-    model = SoundEventLightningModule(
-        class_to_index={f"class_{index}": index for index in range(15)},
-        learning_rate=1e-3,
-        augmentation_config=SpectrogramAugmentationConfig(
-            time_mask_regions_per_1000_frames=1000.0,
-            time_mask_min_size=2,
-            time_mask_max_size=2,
-        ),
-    )
-    spectrogram = torch.ones(2, 1, 4, 8)
-    targets = torch.ones(2, 15, 4)
-    spectrogram_lengths = torch.tensor([8, 4], dtype=torch.long)
-    output_lengths = torch.tensor([4, 2], dtype=torch.long)
-
-    def fake_poisson(value):
-        return torch.ones_like(value)
-
-    randint_values = iter([2, 2, 2, 1])
-
-    def fake_randint(low, high, size, device=None):
-        del low, high, size, device
-        return torch.tensor([next(randint_values)])
-
-    monkeypatch.setattr(torch, "poisson", fake_poisson)
-    monkeypatch.setattr(torch, "randint", fake_randint)
-    augmented_spectrogram, augmented_targets = model._apply_training_augmentations(
-        spectrogram,
-        targets,
-        spectrogram_lengths=spectrogram_lengths,
-        output_lengths=output_lengths,
-    )
-
-    assert torch.equal(augmented_spectrogram[0, :, :, :2], spectrogram[0, :, :, :2])
-    assert torch.equal(augmented_spectrogram[0, :, :, 4:], spectrogram[0, :, :, 4:])
-    assert torch.count_nonzero(augmented_spectrogram[0, :, :, 2:4]) == 0
-    assert torch.count_nonzero(augmented_targets[0, :, 0:1]) > 0
-    assert torch.count_nonzero(augmented_targets[0, :, 1:2]) == 0
-
-    assert torch.equal(augmented_spectrogram[1, :, :, 4:], spectrogram[1, :, :, 4:])
-    assert torch.count_nonzero(augmented_spectrogram[1, :, :, 1:3]) == 0
-    assert torch.count_nonzero(augmented_targets[1, :, 1:2]) == 0
 
 
 def test_on_validation_epoch_end_logs_macro_and_per_class_map(monkeypatch) -> None:

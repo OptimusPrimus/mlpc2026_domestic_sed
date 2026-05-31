@@ -1,16 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import math
 
 import torch
 
 
 @dataclass(frozen=True)
 class SpectrogramAugmentationConfig:
-    time_mask_regions_per_1000_frames: float = 0.0
-    time_mask_min_size: int = 0
-    time_mask_max_size: int = 0
     filter_augment_p: float = 0.0
     filter_db_range: float = 6.0
     filter_n_band_min: int = 3
@@ -44,74 +40,6 @@ def add_waveform_noise(
             noisy_waveforms[batch_index, :valid_samples] + noise[batch_index, :valid_samples]
         )
     return noisy_waveforms
-
-
-def time_mask(
-    features: torch.Tensor,
-    labels: torch.Tensor,
-    *,
-    feature_lengths: torch.Tensor,
-    label_lengths: torch.Tensor,
-    regions_per_1000_frames: float,
-    min_mask_size: int,
-    max_mask_size: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    masked_features = features.clone()
-    masked_labels = labels.clone()
-
-    if regions_per_1000_frames <= 0.0 or min_mask_size <= 0 or max_mask_size < min_mask_size:
-        return masked_features, masked_labels
-
-    for batch_index in range(masked_features.shape[0]):
-        valid_feature_frames = int(feature_lengths[batch_index].item())
-        valid_label_frames = int(label_lengths[batch_index].item())
-        if valid_feature_frames <= 0 or valid_label_frames <= 0:
-            continue
-
-        expected_regions = regions_per_1000_frames * valid_feature_frames / 1000.0
-        num_regions = (
-            int(torch.poisson(torch.tensor(expected_regions, device=masked_features.device)).item())
-            if expected_regions > 0.0
-            else 0
-        )
-        if num_regions <= 0:
-            continue
-
-        for _ in range(num_regions):
-            mask_size = int(
-                torch.randint(
-                    low=min_mask_size,
-                    high=max_mask_size + 1,
-                    size=(1,),
-                    device=masked_features.device,
-                ).item()
-            )
-            if mask_size <= 0 or mask_size > valid_feature_frames:
-                continue
-
-            max_start = valid_feature_frames - mask_size
-            start = int(
-                torch.randint(
-                    low=0,
-                    high=max_start + 1,
-                    size=(1,),
-                    device=masked_features.device,
-                ).item()
-            )
-            end = start + mask_size
-            if end > valid_feature_frames:
-                continue
-
-            masked_features[batch_index, :, :, start:end] = 0
-
-            label_start = math.floor(start * valid_label_frames / valid_feature_frames)
-            label_end = math.ceil(end * valid_label_frames / valid_feature_frames)
-            label_start = max(0, min(label_start, valid_label_frames))
-            label_end = max(label_start, min(label_end, valid_label_frames))
-            if label_end > label_start:
-                masked_labels[batch_index, :, label_start:label_end] = 0
-
-    return masked_features, masked_labels
 
 
 def _sample_band_boundaries(

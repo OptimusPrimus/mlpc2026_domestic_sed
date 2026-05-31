@@ -22,7 +22,6 @@ from domestic_sed.augmentations import (
     SpectrogramAugmentationConfig,
     add_waveform_noise,
     filter_augmentation,
-    time_mask,
 )
 from domestic_sed.architectures import CRNN, CRNNBlockConfig, build_default_crnn_blocks
 from domestic_sed.dataset import MLPC2026SoundEventDataset
@@ -288,14 +287,8 @@ class SoundEventLightningModule(L.LightningModule):
             device=spectrogram.device,
             dtype=spectrogram.dtype,
         )
+        spectrogram, targets = self._apply_training_augmentations(spectrogram, targets)
         spectrogram_lengths = self._num_spectrogram_frames_tensor(batch["audio_num_samples"], device=spectrogram.device)
-        output_lengths = loss_mask[:, 0, :].sum(dim=1).to(dtype=torch.long)
-        spectrogram, targets = self._apply_training_augmentations(
-            spectrogram,
-            targets,
-            spectrogram_lengths=spectrogram_lengths,
-            output_lengths=output_lengths,
-        )
         logits = self.model(spectrogram, input_lengths=spectrogram_lengths)
         loss = self._compute_loss_from_targets(
             logits=logits,
@@ -482,24 +475,10 @@ class SoundEventLightningModule(L.LightningModule):
         self,
         spectrogram: torch.Tensor,
         targets: torch.Tensor,
-        *,
-        spectrogram_lengths: torch.Tensor,
-        output_lengths: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         config = self.augmentation_config
         augmented_spectrogram = spectrogram
         augmented_targets = targets
-
-        if config.time_mask_regions_per_1000_frames > 0.0:
-            augmented_spectrogram, augmented_targets = time_mask(
-                augmented_spectrogram,
-                augmented_targets,
-                feature_lengths=spectrogram_lengths,
-                label_lengths=output_lengths,
-                regions_per_1000_frames=config.time_mask_regions_per_1000_frames,
-                min_mask_size=config.time_mask_min_size,
-                max_mask_size=config.time_mask_max_size,
-            )
 
         if config.filter_augment_p > 0.0 and torch.rand(1).item() < config.filter_augment_p:
             augmented_spectrogram = filter_augmentation(
@@ -648,30 +627,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-epochs", type=int, default=100)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=0.0)
-    parser.add_argument(
-        "--lr-warmup-epochs",
-        type=int,
-        default=0,
-        help="Linearly warm the learning rate from zero to the base rate over the first N epochs.",
-    )
-    parser.add_argument(
-        "--lr-linear-decay-start-epoch",
-        type=int,
-        default=None,
-        help="Start linearly decaying the learning rate at the beginning of epoch N (1-indexed).",
-    )
-    parser.add_argument(
-        "--min-learning-rate",
-        type=float,
-        default=0.0,
-        help="Minimum learning rate reached at the end of linear decay.",
-    )
-    parser.add_argument(
-        "--early-stopping-patience",
-        type=int,
-        default=None,
-        help="Stop training if val/map does not improve for this many validation epochs.",
-    )
+    parser.add_argument("--lr-warmup-epochs", type=int, default=0, help="Linearly warm the learning rate from zero to the base rate over the first N epochs.",)
+    parser.add_argument("--lr-linear-decay-start-epoch", type=int, default=None, help="Start linearly decaying the learning rate at the beginning of epoch N (1-indexed).",)
+    parser.add_argument("--min-learning-rate", type=float, default=0.0, help="Minimum learning rate reached at the end of linear decay.",)
+    parser.add_argument("--early-stopping-patience", type=int, default=None, help="Stop training if val/map does not improve for this many validation epochs.",)
     parser.add_argument("--sample-rate", type=int, default=DEFAULT_SAMPLE_RATE)
     parser.add_argument("--max-duration-seconds", type=float, default=DEFAULT_MAX_DURATION_SECONDS)
     parser.add_argument("--n-mels", type=int, default=DEFAULT_MEL_BINS)
@@ -685,30 +644,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--architecture-p2", type=int, default=5)
     parser.add_argument("--architecture-depth", type=int, default=8)
     parser.add_argument("--architecture-base-multiplier", type=int, default=2)
-    parser.add_argument("--augmentation-time-mask-regions-per-1000-frames", type=float, default=0.0)
-    parser.add_argument("--augmentation-time-mask-min-size", type=int, default=0)
-    parser.add_argument("--augmentation-time-mask-max-size", type=int, default=0)
     parser.add_argument("--augmentation-filter-p", type=float, default=0.0)
     parser.add_argument("--augmentation-filter-db-range", type=float, default=6.0)
     parser.add_argument("--augmentation-filter-n-band-min", type=int, default=3)
     parser.add_argument("--augmentation-filter-n-band-max", type=int, default=6)
     parser.add_argument("--augmentation-filter-min-bw", type=int, default=6)
     parser.add_argument("--augmentation-waveform-noise-max-level", type=float, default=0.0)
-    parser.add_argument(
-        "--class-names",
-        type=str,
-        default=None,
-        help="Comma-separated list of the 15 class names. Defaults to labels found in train/annotations.csv.",
-    )
+    parser.add_argument("--class-names", type=str, default=None, help="Comma-separated list of the 15 class names. Defaults to labels found in train/annotations.csv.",)
     parser.add_argument("--accelerator", type=str, default="auto")
     parser.add_argument("--devices", type=str, default="auto")
     parser.add_argument("--precision", type=str, default="32-true")
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=None,
-        help="Random seed. If omitted, choose a random seed for this run.",
-    )
+    parser.add_argument("--seed", type=int, default=None, help="Random seed. If omitted, choose a random seed for this run.",)
     parser.add_argument("--wandb-project", type=str, default="domestic-sed")
     parser.add_argument("--wandb-run-name", type=str, default=None)
     parser.add_argument("--wandb-save-dir", type=Path, default=Path("wandb"))
@@ -736,12 +682,6 @@ def main() -> None:
         raise ValueError("--min-learning-rate must be non-negative.")
     if args.min_learning_rate > args.learning_rate:
         raise ValueError("--min-learning-rate must be less than or equal to --learning-rate.")
-    if args.augmentation_time_mask_regions_per_1000_frames < 0.0:
-        raise ValueError("--augmentation-time-mask-regions-per-1000-frames must be non-negative.")
-    if args.augmentation_time_mask_min_size < 0:
-        raise ValueError("--augmentation-time-mask-min-size must be non-negative.")
-    if args.augmentation_time_mask_max_size < args.augmentation_time_mask_min_size:
-        raise ValueError("--augmentation-time-mask-max-size must be greater than or equal to --augmentation-time-mask-min-size.")
     if args.augmentation_filter_p < 0.0 or args.augmentation_filter_p > 1.0:
         raise ValueError("--augmentation-filter-p must be in [0, 1].")
     if args.augmentation_filter_db_range < 0.0:
@@ -762,9 +702,6 @@ def main() -> None:
         initial_class_names = [name.strip() for name in args.class_names.split(",") if name.strip()]
 
     augmentation_config = SpectrogramAugmentationConfig(
-        time_mask_regions_per_1000_frames=args.augmentation_time_mask_regions_per_1000_frames,
-        time_mask_min_size=args.augmentation_time_mask_min_size,
-        time_mask_max_size=args.augmentation_time_mask_max_size,
         filter_augment_p=args.augmentation_filter_p,
         filter_db_range=args.augmentation_filter_db_range,
         filter_n_band_min=args.augmentation_filter_n_band_min,
